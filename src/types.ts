@@ -3,7 +3,7 @@
  */
 
 import type { Model } from "@earendil-works/pi-ai";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { CreateAgentSessionOptions, CreateAgentSessionServicesOptions, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -64,13 +64,38 @@ export interface PoolGraph {
 
 // ---------------------------------------------------------------- 角色 / 任务
 
+/**
+ * SDK 强制接管的 pi 创建选项 —— 这几样由 SDK 管，不能由角色指定：
+ *   会话文件（周期标记 / 摘要 / 分叉 / 续跑）、模型（随容量许可）、注入产物工具与事件、
+ *   创建时机与释放。其余 pi 选项一律直通。
+ */
+type ManagedOptions = "sessionManager" | "model" | "modelRuntime" | "thinkingLevel" | "scopedModels" | "agentDir" | "sessionStartEvent";
+
+/**
+ * 资源发现选项：SDK 用它们构造 pi 的 DefaultResourceLoader（不传 resourceLoader 时）。
+ * 等同于 pi 自己的 CreateAgentSessionServicesOptions.resourceLoaderOptions，再去掉 systemPrompt。
+ */
+export type PiResourceOptions = NonNullable<CreateAgentSessionServicesOptions["resourceLoaderOptions"]>;
+
+/**
+ * 可以原样交给 pi 的创建选项（去掉 SDK 接管的那几样），外加资源发现选项：
+ * additionalSkillPaths / additionalExtensionPaths / extensionFactories / noSkills / noContextFiles …
+ */
+export type PiAgentOptions = Omit<CreateAgentSessionOptions, ManagedOptions> & PiResourceOptions;
+
 export interface AgentRole {
   name: string;
-  /** 系统提示词 */
+  /** 系统提示词：作为 pi 的 systemPrompt；若 pi.resourceLoader 自带提示词，这段会追加在其后 */
   system: string;
-  /** 开启的 pi 内置工具，如 ["read","grep","bash","edit","write"]；不填 = 不开内置工具 */
+  /**
+   * 直通 pi 的创建选项：resourceLoader（扩展 / skills / 提示词模板 / AGENTS.md / 系统提示词追加）、
+   * tools / excludeTools / customTools、settingsManager、cwd…… 原样使用。
+   * SDK 只覆盖：会话文件、模型、注入产物工具、创建时机。
+   */
+  pi?: PiAgentOptions | ((ctx: { model: Model<any>; sessionName: string }) => PiAgentOptions | Promise<PiAgentOptions>);
+  /** 便捷写法：要开哪些 pi 内置工具，等价于塞进 pi.tools */
   tools?: string[];
-  /** 自定义工具（pi ToolDefinition） */
+  /** 额外自定义工具；和 pi.customTools 合并 */
   customTools?: ToolDefinition<any, any, any>[];
   /** 注入 SDK 的产物工具（默认开）；可限定允许写的类型 */
   artifactTool?: boolean | { kinds?: string[] };

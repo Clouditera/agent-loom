@@ -20,7 +20,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { Type } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
-  createExtensionRuntime,
+  DefaultResourceLoader,
   defineTool,
   SessionManager,
   SettingsManager,
@@ -30,7 +30,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { ArtifactStore } from "./artifacts.ts";
 import { CYCLE_TYPE, DIGEST_TYPE, cycleData, DEFAULT_SUMMARY_PROMPT, serializeSegment, type CycleData, type EntryLike } from "./serialize.ts";
-import type { AgentRole, ArtifactSource, Digest, ForkOptions, InheritPlan, RunEvent, SummarySpec, TakeMode, TaskView, ThinkingLevel } from "./types.ts";
+import type { AgentRole, ArtifactSource, Digest, ForkOptions, InheritPlan, PiAgentOptions, PiResourceOptions, RunEvent, SummarySpec, TakeMode, TaskView, ThinkingLevel } from "./types.ts";
 import { ArtifactError } from "./types.ts";
 import { clip, hashText, Mutex, sha256 } from "./util.ts";
 
@@ -94,6 +94,7 @@ export class Session {
 
   /** @internal 打开（或复活）会话文件；上次进程退出时没收尾的任务补一个 aborted 结束标记 */
   static open(host: SessionHost, name: string, role: AgentRole, file: string, parent?: string): Session {
+    if (role.pi && typeof role.pi !== "function") assertNoManaged(role, role.pi);
     const s = new Session(host, name, role, file, parent);
     for (const t of s.tasks()) {
       if (t.status !== "running") continue;
@@ -255,20 +256,25 @@ export class Session {
   async ensureAgent(model: Model<any>, thinking: ThinkingLevel): Promise<AgentSession> {
     const key = `${model.provider}/${model.id}`;
     if (!this.agent) {
-      const custom: ToolDefinition<any, any, any>[] = [...(this.role.customTools ?? [])];
+      const pi = await this.piOptions(model);
+      const cwd = pi.cwd ?? this.host.cwd;
+      const custom: ToolDefinition<any, any, any>[] = [...(this.role.customTools ?? []), ...(pi.customTools ?? [])];
       if (this.role.artifactTool !== false) custom.push(this.makeArtifactTool());
-      const toolNames = [...(this.role.tools ?? []), ...custom.map((t) => t.name)];
+      const tools = [...new Set([...(this.role.tools ?? []), ...(pi.tools ?? []), ...custom.map((t) => t.name)])];
+      const settingsManager = pi.settingsManager ?? SettingsManager.inMemory(this.host.piSettings as never);
       const { session } = await createAgentSession({
-        cwd: this.host.cwd,
+        ...pi, // 资源发现选项 createAgentSession 不认，会被忽略；它们在下面的加载器里生效
+        // ↓ SDK 接管：会话文件、模型、产物工具注入、创建时机（角色传了会在创建会话时直接报错）
+        cwd,
         agentDir: join(this.host.workdir, "agent"),
         model,
         thinkingLevel: thinking,
         modelRuntime: this.host.modelRuntime,
-        resourceLoader: makeLoader(this.role.system),
-        tools: toolNames,
-        customTools: custom,
         sessionManager: this.sm,
-        settingsManager: SettingsManager.inMemory(this.host.piSettings as never),
+        resourceLoader: await this.resourceLoader(pi, cwd, settingsManager),
+        tools,
+        customTools: custom,
+        settingsManager,
       });
       // 模型回退守卫：pi 在凭证缺失时可能静默换成别的模型，这里硬失败
       const got = session.model ? `${session.model.provider}/${session.model.id}` : "（无）";
@@ -285,6 +291,53 @@ export class Session {
     }
     this.agent.setThinkingLevel(thinking);
     return this.agent;
+  }
+
+  /** 角色的 pi 选项：对象或按当前模型 / 会话名计算的工厂 */
+  private async piOptions(model: Model<any>): Promise<PiAgentOptions> {
+    const raw = this.role.pi;
+    const pi = (typeof raw === "function" ? await raw({ model, sessionName: this.name }) : raw) ?? {};
+    assertNoManaged(this.role, pi);
+    return pi;
+  }
+
+  /**
+   * 资源加载器：角色给了一个就用它，否则用 pi 的 DefaultResourceLoader（扩展 / skills / 提示词模板 / AGENTS.md），
+   * 整个 pi 选项原样交给它（它只读自己认识的键，pi 以后新增的资源选项也直接生效）。
+   * 角色的 system 总是生效：pi 没带基础提示词时它就是基础提示词；带了（systemPrompt 或自己的 resourceLoader）就追加在后。
+   */
+  private async resourceLoader(pi: PiAgentOptions, cwd: string, settingsManager: unknown): Promise<ResourceLoader> {
+    const given = pi.resourceLoader;
+    if (!given) {
+      const system = this.role.system;
+      const ownBase = pi.systemPrompt !== undefined;
+      const userAppend = pi.appendSystemPromptOverride;
+      const loader = new DefaultResourceLoader({
+        ...(pi as PiResourceOptions),
+        cwd,
+        agentDir: join(this.host.workdir, "agent"),
+        settingsManager: settingsManager as never,
+        systemPrompt: ownBase ? pi.systemPrompt : system,
+        appendSystemPromptOverride:
+          ownBase && system ? (base) => [...(userAppend ? userAppend(base) : base), system] : userAppend,
+      });
+      await loader.reload();
+      return loader;
+    }
+    const system = this.role.system;
+    return {
+      getExtensions: () => given.getExtensions(),
+      getSkills: () => given.getSkills(),
+      getPrompts: () => given.getPrompts(),
+      getThemes: () => given.getThemes(),
+      getAgentsFiles: () => given.getAgentsFiles(),
+      getSystemPrompt: () => given.getSystemPrompt(),
+      getSystemPromptSource: () => given.getSystemPromptSource(),
+      getAppendSystemPrompt: () => (system ? [...given.getAppendSystemPrompt(), system] : given.getAppendSystemPrompt()),
+      getAppendSystemPromptSources: () => given.getAppendSystemPromptSources(),
+      extendResources: (paths) => given.extendResources(paths),
+      reload: async (opts) => given.reload(opts),
+    };
   }
 
   /** @internal */
@@ -467,20 +520,17 @@ export class Session {
 
 // ---------------------------------------------------------------- 辅助
 
-function makeLoader(system: string): ResourceLoader {
-  return {
-    getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
-    getSkills: () => ({ skills: [], diagnostics: [] }),
-    getPrompts: () => ({ prompts: [], diagnostics: [] }),
-    getThemes: () => ({ themes: [], diagnostics: [] }),
-    getAgentsFiles: () => ({ agentsFiles: [] }),
-    getSystemPrompt: () => system,
-    getSystemPromptSource: () => undefined,
-    getAppendSystemPrompt: () => [],
-    getAppendSystemPromptSources: () => [],
-    extendResources: () => {},
-    reload: async () => {},
-  };
+
+/** SDK 接管、角色不能在 pi 里指定的创建选项 */
+const MANAGED_KEYS = ["sessionManager", "model", "modelRuntime", "thinkingLevel", "scopedModels", "agentDir", "sessionStartEvent"] as const;
+
+function assertNoManaged(role: AgentRole, pi: PiAgentOptions): void {
+  const given = MANAGED_KEYS.filter((k) => (pi as Record<string, unknown>)[k] !== undefined);
+  if (!given.length) return;
+  throw new Error(
+    `角色 ${role.name}：pi.${given.join(" / pi.")} 由 SDK 接管，不能在角色里指定` +
+      `（会话文件、模型和思考强度随容量许可分配；换模型请改容量，思考强度用 role.thinking）`,
+  );
 }
 
 function isContextEntry(e: EntryLike): boolean {

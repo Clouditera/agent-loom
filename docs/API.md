@@ -1,6 +1,6 @@
 # agent-loom 接口与用法
 
-> 标 **★** 的是池的输入 / 输出契约（reads / writes）相关接口。所有接口都有测试（`npm test`，35 个用例，用假模型跑）。
+> 标 **★** 的是池的输入 / 输出契约（reads / writes）相关接口。所有接口都有测试（`npm test`，40 个用例，用假模型跑）。
 
 ---
 
@@ -10,7 +10,7 @@
 |---|---|---|
 | 运行 | `createRun` / `run.close` / `run.stop` / `run.abort` | 一次运行；同一 workdir 再启动就是续跑 |
 | 资源与池 | `run.capacity` / `run.pool` ★reads/writes / `run.graph` ★ | 容量是真闸门，池只限流；池声明读什么、写什么 |
-| 角色与会话 | `AgentRole` / `run.session` / `session.tasks` | 会话 = 一个 pi 会话文件 + 一个角色 |
+| 角色与会话 | `AgentRole`（`pi` 直通）/ `run.session` / `session.tasks` | 会话 = 一个 pi 会话文件 + 一个角色；角色的 agent 能力全部直通 pi |
 | 任务 | `pool.run` | 一次提示词跑一个完整 turn，全程只持有一份许可，失败时任务内重试 |
 | 上下文 | `session.digest` / `session.compress` / `session.fork` | 旁路摘要、原位压缩、分叉继承 |
 | 产物 | `run.artifacts.*` / agent 的 `artifact` 工具 / 文件钩子 | 驱动下游的东西必须登记 |
@@ -111,12 +111,20 @@ run.graph();
 ```ts
 interface AgentRole {
   name: string;
-  system: string;                         // 系统提示词
-  tools?: string[];                       // pi 内置工具，如 ["read","grep","bash","edit","write"]；不填 = 不开
-  customTools?: ToolDefinition[];         // 自定义工具（pi ToolDefinition）
+  system: string;                         // 系统提示词（见下方「system 放在哪」）
+  pi?: PiAgentOptions | ((ctx: { model; sessionName }) => PiAgentOptions | Promise<PiAgentOptions>);
+  tools?: string[];                       // 便捷写法，并入 pi.tools
+  customTools?: ToolDefinition[];         // 便捷写法，并入 pi.customTools
   artifactTool?: boolean | { kinds?: string[] };   // 注入产物工具，默认开
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 }
+
+// = pi 的 CreateAgentSessionOptions 去掉 SDK 接管的键
+//   + pi 的 DefaultResourceLoader 选项（资源发现）
+type PiAgentOptions = Omit<CreateAgentSessionOptions, "sessionManager" | "model" | "modelRuntime"
+                                                     | "thinkingLevel" | "scopedModels" | "agentDir" | "sessionStartEvent">
+                    & ResourceLoaderOptions;   // additionalSkillPaths / additionalExtensionPaths / additionalPromptTemplatePaths /
+                                               // extensionFactories / noSkills / noExtensions / noContextFiles / appendSystemPrompt / *Override …
 
 run.session(name: string, role: AgentRole): Promise<Session>   // 按名字开或复活
 run.getSession(name): Session | undefined
@@ -135,6 +143,49 @@ interface TaskView {
   startEntry: string; endEntry?: string;
   origin: string;                     // 谁跑的：分叉继承来的任务保留原会话名
 }
+```
+
+**角色 = pi 的 agent，SDK 只接管四样**：
+
+| SDK 接管 | 为什么 |
+|---|---|
+| 会话文件（`sessionManager`） | 周期标记、摘要、压缩、分叉、续跑都建在它上面 |
+| 模型（`model` / `modelRuntime` / `thinkingLevel` / `scopedModels`） | 模型随容量许可分配；换模型改容量，思考强度用 `role.thinking` |
+| 注入产物工具、订阅事件 | 驱动下游的东西必须能登记；文件钩子靠事件 |
+| 创建时机与释放（`agentDir` / `sessionStartEvent`） | 第一次拿到许可时才创建；`session.dispose()` 释放 |
+
+这几样写进 `pi` 会直接报错（对象在 `run.session` 时、工厂在建 agent 时）。其余全部原样交给 pi：
+扩展、skills、提示词模板、AGENTS.md、`tools` / `excludeTools` / `noTools`、`settingsManager`、`cwd`、MCP……
+pi 以后加的新选项也不用等 SDK 改。
+
+**pi 选项怎么分发**：整个 `pi` 对象原样交给 `createAgentSession`，没给 `pi.resourceLoader` 时也原样交给 SDK 创建的 `DefaultResourceLoader`
+（两边都只读自己认识的键）。所以 pi 以后新增的会话 / 资源选项直接可用。
+
+**system 放在哪**：pi 没带基础提示词时，`system` 就是基础提示词；带了（`pi.systemPrompt` 或自己的 `pi.resourceLoader`），
+那个保持原样，`system` 追加在 pi 的追加提示词之后。
+
+**两个 pi 的规则要知道**：
+- `tools` 一旦给了就是白名单：扩展注册的工具也要写进去（产物工具和 `customTools` 由 SDK 自动并入）。
+- skills 只有在开了能读文件的工具（如 `read`）时才会列进系统提示词。
+
+**默认会做资源发现**（和 pi 命令行一样）：`cwd` 下的 `.pi/`、`.agents/skills`、AGENTS.md，以及 `~/.agents/skills`。
+`agentDir` 固定为 `workdir/agent`，所以 `~/.pi/agent` 里的个人扩展不会混进来。要完全隔离：
+
+```ts
+const role: AgentRole = {
+  name: "reviewer",
+  system: "你是审阅者……",
+  pi: {
+    tools: ["read", "grep", "lint"],               // lint 来自下面的扩展
+    noSkills: true, noExtensions: true, noContextFiles: true, noPromptTemplates: true,
+    additionalSkillPaths: ["./skills"],            // 只用这里的 skills
+    additionalExtensionPaths: ["./ext/lint.ts"],   // 只加载这个扩展
+    additionalPromptTemplatePaths: ["./prompts"],  // 任务里发 /review 会展开成模板
+  },
+};
+
+// 按模型 / 会话决定配置（比如每个会话一个工作目录）
+const perSession: AgentRole = { name: "w", system: "...", pi: ({ sessionName }) => ({ cwd: `/work/${sessionName}`, tools: ["read", "bash"] }) };
 ```
 
 - 会话 = 一个 pi 会话文件（`workdir/sessions/<name>.jsonl`）加一个角色。系统提示词以 system 消息形式落在条目里。
