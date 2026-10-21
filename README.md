@@ -157,3 +157,9 @@ examples/       01-context、02-relay
 - **压缩和分叉以「任务」为单位**：不在任何任务里的手工条目不参与。
 - **没做**：速率 / 预算型资源、汇合原语、会话间通信、人工确认。
 - **只用 pi 公开 API**：`createAgentSession`、`SessionManager.open`、`appendCustomEntry`、`appendContextEdit`、`getBranch`、`ModelRuntime.completeSimple`。分叉是自己写 jsonl，不依赖任何私有成员。
+
+## License
+
+Copyright 2026 Clouditera
+
+本项目采用 [Apache License 2.0](LICENSE) 授权。
