@@ -25,7 +25,9 @@ import {
   type ArtifactSelector,
   type ArtifactSource,
   type CapacityOptions,
+  type GraphEdge,
   type KindSpec,
+  type PoolGraph,
   type ModelRef,
   type PoolOptions,
   type Priority,
@@ -35,6 +37,7 @@ import {
   type TaskResult,
   type ThinkingLevel,
   type TimedEvent,
+  type WriteSpec,
 } from "./types.ts";
 import { appendJSONL, atomicWriteJSON, ensureDir, newId, Notifier, readJSON, readJSONL } from "./util.ts";
 
@@ -60,8 +63,8 @@ export interface RunOptions {
 }
 
 export interface ConsumeOptions {
-  /** 从什么状态取活 */
-  reads: ArtifactSelector;
+  /** 从什么状态取活；不填用池声明的 reads */
+  reads?: ArtifactSelector;
   /** 处理一条：通常在里面开 / 分叉会话、跑一个 Task、推进这条产物的状态 */
   handle: (item: Artifact, ctx: ConsumeContext) => Promise<void>;
   /** 某条处理失败时：stop（默认）= 停整个 run，状态已落盘可续跑；skip = 本 run 内跳过这条继续 */
@@ -183,6 +186,7 @@ export class Run {
     appendJSONL(this.ledgerPath, { t: "run", runId: this.id, at: Date.now(), resumed: prevRuns > 0 });
 
     this.store = new ArtifactStore(join(this.workdir, "artifacts"), (e) => this.emit(e), () => this.touch());
+    this.store.guard = (w) => this.guardWrite(w);
     this.artifacts = {
       defineKind: (kind, spec) => this.store.defineKind(kind, spec),
       create: (kind, input = {}) => this.store.create(kind, input, this.codeSource()),
@@ -236,7 +240,10 @@ export class Run {
     for (const n of needs) if (!this.capacities.has(n.capacity)) throw new Error(`池 ${name} 需要的容量 ${n.capacity} 还没声明`);
     const models = needs.filter((n) => this.capacities.get(n.capacity)!.model);
     if (models.length > 1) throw new Error(`池 ${name} 需要了多个模型容量（${models.map((m) => m.capacity).join(", ")}），一个池最多一个`);
-    const p = new Pool(this, name, needs, opts.concurrency, opts.priority ?? 50);
+    if (opts.reads && !opts.reads.kind) throw new Error(`池 ${name} 的 reads 需要 kind`);
+    const writes = opts.writes === undefined ? undefined : [opts.writes].flat();
+    for (const w of writes ?? []) if (!w.kind) throw new Error(`池 ${name} 的 writes 需要 kind`);
+    const p = new Pool(this, name, needs, opts.concurrency, opts.priority ?? 50, opts.reads, writes);
     this.pools.set(name, p);
     this.dirty();
     return p;
@@ -306,6 +313,25 @@ export class Run {
     }
   }
 
+  /**
+   * 循环零件：目标（body）+ 判定（until）+ 上限（max）。每轮自动用 step 记账，
+   * 续跑时已完成的轮次直接取回记下的结果、并用同一个 until 重新判定，从下一轮接着跑。
+   */
+  async loop<T>(
+    name: string,
+    opts: { max: number; until?: (result: T, round: number) => boolean | Promise<boolean> },
+    body: (round: number) => Promise<T>,
+  ): Promise<{ rounds: number; results: T[]; stopped: "until" | "max" }> {
+    const max = Math.max(1, Math.floor(opts.max));
+    const results: T[] = [];
+    for (let round = 1; round <= max; round++) {
+      const r = await this.step(`${name}#${round}`, () => body(round));
+      results.push(r);
+      if (opts.until && (await opts.until(r, round))) return { rounds: round, results, stopped: "until" };
+    }
+    return { rounds: max, results, stopped: "max" };
+  }
+
   /** 平稳停止：不再派新活，在跑的跑完 */
   stop(reason: string): void {
     if (this.status !== "running") return;
@@ -351,7 +377,55 @@ export class Run {
     return () => this.listeners.delete(fn);
   }
 
-  /** 一个接口看全局：容量 / 池 / 在跑与最近的任务 / 产物计数 / 会话 / 串行步。state.json 是它的落盘版 */
+  /**
+   * 链路：把各池的 writes 和 reads 对起来（同类型、状态有交集即连一段），并给出每段积压。
+   * warnings = 有池读却没有池声明写；terminal = 有池写却没有池读（通常是终态）。
+   */
+  graph(): PoolGraph {
+    const pools = [...this.pools.values()];
+    const edges: GraphEdge[] = [];
+    const fed = new Set<string>();
+    const consumed = new Set<string>();
+    for (const w of pools) {
+      for (const ws of w.writes ?? []) {
+        for (const r of pools) {
+          if (!r.reads || r.reads.kind !== ws.kind) continue;
+          const wStates = ws.state === undefined ? undefined : [ws.state].flat();
+          const rStates = r.reads.state === undefined ? undefined : [r.reads.state].flat();
+          const states = wStates && rStates ? wStates.filter((s) => rStates.includes(s)) : (wStates ?? rStates ?? ["*"]);
+          for (const state of states) {
+            const backlog = this.store.query(state === "*" ? { kind: ws.kind, where: r.reads.where } : { kind: ws.kind, state, where: r.reads.where }).length;
+            edges.push({ from: w.name, to: r.name, kind: ws.kind, state, backlog });
+            fed.add(`${r.name}|${ws.kind}|${state}`);
+            consumed.add(`${w.name}|${ws.kind}|${state}`);
+          }
+        }
+      }
+    }
+    const warnings: string[] = [];
+    for (const r of pools) {
+      const rd = r.reads;
+      if (!rd) continue;
+      const states = rd.state === undefined ? ["*"] : [rd.state].flat();
+      for (const s of states) {
+        const any = [...fed].some((k) => k.startsWith(`${r.name}|${rd.kind}|`) && (s === "*" || k.endsWith(`|${s}`) || k.endsWith("|*")));
+        if (!any) warnings.push(`池 ${r.name} 读 ${rd.kind}:${s}，但没有池声明写它（若由池外代码投放可忽略）`);
+      }
+    }
+    const terminal: string[] = [];
+    for (const w of pools) {
+      for (const ws of w.writes ?? []) {
+        const states = ws.state === undefined ? ["*"] : [ws.state].flat();
+        for (const s of states) {
+          const any = [...consumed].some((k) => k.startsWith(`${w.name}|${ws.kind}|`) && (s === "*" || k.endsWith(`|${s}`) || k.endsWith("|*")));
+          if (!any) terminal.push(`${w.name} → ${ws.kind}:${s}`);
+        }
+      }
+    }
+    return { edges, warnings, terminal };
+  }
+
+  /** 一个接口看全局：容量 / 池 / 链路 / 在跑与最近的任务 / 产物计数 / 会话 / 串行步。state.json 是它的落盘版 */
   stats() {
     return {
       runId: this.id,
@@ -363,6 +437,7 @@ export class Run {
       quiescent: this.isQuiescent(),
       capacities: [...this.capacities.values()].map((c) => c.stats()),
       pools: [...this.pools.values()].map((p) => p.stats()),
+      graph: this.graph(),
       tasks: { running: [...this.running.values()], recent: this.recent.slice(-30) },
       artifacts: this.store.counts(),
       sessions: Object.entries(this.sessionMeta).map(([name, m]) => ({ name, role: m.role, parent: m.parent, file: m.file })),
@@ -504,6 +579,22 @@ export class Run {
     return { model, thinking };
   }
 
+  /** 写入校验：写入来源所在的池声明了 writes 时，只放行声明过的 类型+状态 */
+  private guardWrite(w: { kind: string; state: string; stateChanged: boolean; created: boolean; source: ArtifactSource }): string | null {
+    if (w.kind.startsWith("sdk:") || !w.source.pool) return null;
+    const pool = this.pools.get(w.source.pool);
+    if (!pool?.writes) return null;
+    const declared = pool.writes;
+    if (!w.created && !w.stateChanged) {
+      // 只改字段、不改状态：本池读或写的类型都允许
+      if (pool.reads?.kind === w.kind || declared.some((d) => d.kind === w.kind)) return null;
+      return `池 ${pool.name} 没有声明会操作类型 ${w.kind}。本池声明的产出：${describeWrites(declared)}`;
+    }
+    const ok = declared.some((d) => d.kind === w.kind && (d.state === undefined || [d.state].flat().includes(w.state)));
+    if (ok) return null;
+    return `池 ${pool.name} 没有声明会写 ${w.kind}:${w.state}。本池声明的产出：${describeWrites(declared)}`;
+  }
+
   private codeSource(): ArtifactSource {
     const lane = laneCtx.getStore();
     return { runId: this.id, by: "code", pool: lane?.pool, item: lane?.item };
@@ -557,15 +648,29 @@ export class Run {
 export class Pool {
   readonly name: string;
   readonly priority: Priority;
+  /** 输入声明 */
+  readonly reads?: ArtifactSelector;
+  /** 输出声明 */
+  readonly writes?: WriteSpec[];
   private owner: Run;
   private needs: Array<{ capacity: string; count: number }>;
   private gate: PoolGate;
   private consumers: Array<{ reads: ArtifactSelector; report: ConsumeReport; active: number }> = [];
 
   /** @internal 用 run.pool() */
-  constructor(run: Run, name: string, needs: Array<{ capacity: string; count: number }>, concurrency: number, priority: Priority) {
+  constructor(
+    run: Run,
+    name: string,
+    needs: Array<{ capacity: string; count: number }>,
+    concurrency: number,
+    priority: Priority,
+    reads?: ArtifactSelector,
+    writes?: WriteSpec[],
+  ) {
     this.owner = run;
     this.name = name;
+    this.reads = reads;
+    this.writes = writes;
     this.needs = needs;
     this.gate = new PoolGate(name, concurrency);
     this.priority = priority;
@@ -613,7 +718,7 @@ export class Pool {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         rec.attempt = attempt;
         session.current.attempt = attempt;
-        const text = attempt === 1 ? prompt : (opts.retry?.retryPrompt ?? defaultRetryPrompt)(lastErr, attempt, prompt);
+        const text = attempt === 1 ? this.withHint(prompt, session, opts) : (opts.retry?.retryPrompt ?? defaultRetryPrompt)(lastErr, attempt, prompt);
         session.appendCycle({ phase: "start", taskId, attempt, session: session.name, label: opts.label, prompt: text.slice(0, 400) });
         run.emit({ type: "task:start", taskId, pool: this.name, session: session.name, attempt, label: opts.label });
         const r = await session.promptOnce(text, { signal, timeoutMs: opts.timeoutMs });
@@ -667,8 +772,10 @@ export class Pool {
    */
   async consume(opts: ConsumeOptions): Promise<ConsumeReport> {
     const run = this.owner;
+    const reads = opts.reads ?? this.reads;
+    if (!reads) throw new Error(`池 ${this.name} 没有声明 reads：在 run.pool(name, { reads }) 或 consume({ reads }) 里给出`);
     const report: ConsumeReport = { pool: this.name, handled: 0, failed: 0, stalled: [] };
-    const entry = { reads: opts.reads, report, active: 0 };
+    const entry = { reads, report, active: 0 };
     this.consumers.push(entry);
     const stalled = new Set<string>();
     let firstError: unknown;
@@ -678,17 +785,17 @@ export class Pool {
       await Promise.all(
         Array.from({ length: lanes }, async () => {
           while (!run.stopping) {
-            let item = run.pick(opts.reads, stalled);
+            let item = run.pick(reads, stalled);
             if (!item) {
               if (run.isQuiescent()) {
-                item = run.pick(opts.reads, stalled);
+                item = run.pick(reads, stalled);
                 if (!item) return;
               } else {
                 await run.notifier.wait(run.pollMs, run.stopSignal);
                 continue;
               }
             }
-            await this.handleItem(item, opts, entry, stalled, (e) => {
+            await this.handleItem(item, { ...opts, reads }, entry, stalled, (e) => {
               firstError ??= e;
             });
           }
@@ -704,7 +811,7 @@ export class Pool {
 
   private async handleItem(
     item: Artifact,
-    opts: ConsumeOptions,
+    opts: ConsumeOptions & { reads: ArtifactSelector },
     entry: { reads: ArtifactSelector; report: ConsumeReport; active: number },
     stalled: Set<string>,
     fail: (e: unknown) => void,
@@ -740,17 +847,30 @@ export class Pool {
     }
   }
 
+  /** 池声明了 writes：在首次提示词末尾告诉 agent 这一步要登记什么 */
+  private withHint(prompt: string, session: Session, opts: TaskOptions): string {
+    if (!this.writes?.length || opts.outputHint === false) return prompt;
+    const how = session.role.artifactTool === false ? "" : "（用 artifact 工具）";
+    return `${prompt}\n\n---\n本步骤需登记的产出${how}：${describeWrites(this.writes)}`;
+  }
+
   stats() {
     return {
       ...this.gate.stats(),
       priority: this.priority,
       needs: this.needs,
+      reads: this.reads ? { kind: this.reads.kind, state: this.reads.state } : undefined,
+      writes: this.writes,
       consumers: this.consumers.map((c) => ({ reads: { kind: c.reads.kind, state: c.reads.state }, active: c.active, ...c.report })),
     };
   }
 }
 
 // ================================================================ 辅助
+
+function describeWrites(ws: WriteSpec[]): string {
+  return ws.map((w) => `${w.kind}（${w.state === undefined ? "任意状态" : `状态 ${[w.state].flat().join(" / ")}`}）`).join("；");
+}
 
 function defaultRetryPrompt(err: string, attempt: number): string {
   return `上一次执行中断（第 ${attempt - 1} 次尝试，原因：${err.slice(0, 300)}）。请核对当前进展，从未完成处继续完成原任务，不要重复已经完成的部分。`;

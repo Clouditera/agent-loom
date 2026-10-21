@@ -34,7 +34,12 @@ export interface UpdateInput {
   file?: FileRef;
 }
 
+/** 写入守卫：返回 null 放行；返回字符串 = 拒绝原因 */
+export type WriteGuard = (w: { kind: string; state: string; stateChanged: boolean; created: boolean; source: ArtifactSource }) => string | null;
+
 export class ArtifactStore {
+  /** 由 Run 注入：按"写入来源所在的池"校验 writes 声明 */
+  guard?: WriteGuard;
   private dir: string;
   private items = new Map<string, Artifact>();
   private seq = new Map<string, number>();
@@ -102,6 +107,7 @@ export class ArtifactStore {
     this.checkRequired(kind, spec, fields);
     const id = input.id ?? newId(slug(kind));
     if (this.items.has(id)) throw new ArtifactError(`产物编号 ${id} 已存在；要修改请用 update`);
+    this.checkGuard({ kind, state, stateChanged: true, created: true, source });
     const now = Date.now();
     const a: Artifact = {
       id,
@@ -134,6 +140,8 @@ export class ArtifactStore {
     }
     const spec = this.kinds.get(a.kind);
     const prev = a.state;
+    const nextState = input.state ?? a.state;
+    this.checkGuard({ kind: a.kind, state: nextState, stateChanged: nextState !== a.state, created: false, source });
     if (input.state !== undefined && input.state !== a.state) {
       this.checkState(a.kind, spec, input.state);
       const allowed = spec?.transitions?.[a.state];
@@ -170,6 +178,11 @@ export class ArtifactStore {
     if (!existing) return this.create(kind, { id, file, state, fields: {} }, source);
     if (existing.file?.sha256 === file.sha256) return structuredClone(existing);
     return this.update(id, { file, state }, source);
+  }
+
+  private checkGuard(w: Parameters<WriteGuard>[0]): void {
+    const why = this.guard?.(w);
+    if (why) throw new ArtifactError(why);
   }
 
   private persist(a: Artifact): void {

@@ -234,3 +234,35 @@ test("续跑：同一 workdir 再启动——已完成的 step 跳过、会话�
   assert.ok(state.capacities.length === 1 && state.pools.length === 1);
   assert.ok(existsSync(join(workdir, "sessions.json")));
 });
+
+test("循环零件 run.loop：目标 + 判定 + 上限；续跑时从下一轮接着跑", async () => {
+  const dir = tmpDir("loop");
+  const workdir = join(dir, "run");
+  const cwd = join(dir, "cwd");
+  const bodyCalls: number[] = [];
+  {
+    const { runtime } = await fauxRuntime({ dir });
+    const run = await createRun({ workdir, cwd, modelRuntime: runtime });
+    // 第 2 轮"崩溃"
+    await assert.rejects(
+      run.loop("refine", { max: 5, until: (score: number) => score >= 3 }, async (round) => {
+        bodyCalls.push(round);
+        if (round === 2) throw new Error("crash");
+        return round;
+      }),
+      /crash/,
+    );
+    await run.close();
+  }
+  const { runtime } = await fauxRuntime({ dir });
+  const run = await createRun({ workdir, cwd, modelRuntime: runtime });
+  const r = await run.loop("refine", { max: 5, until: (score: number) => score >= 3 }, async (round) => {
+    bodyCalls.push(round);
+    return round;
+  });
+  assert.deepEqual(bodyCalls, [1, 2, 2, 3], "第 1 轮不重做，从第 2 轮接着跑");
+  assert.deepEqual(r, { rounds: 3, results: [1, 2, 3], stopped: "until" });
+  const capped = await run.loop("cap", { max: 2 }, async (round) => round);
+  assert.equal(capped.stopped, "max");
+  await run.close();
+});

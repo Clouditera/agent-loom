@@ -392,8 +392,14 @@ export class Session {
       if (!(abs === dir || abs.startsWith(dir + sep))) continue;
       if (!existsSync(abs)) return;
       const buf = readFileSync(abs);
-      const a = this.host.artifacts.upsertFile(t.kind, { path: relative(this.host.cwd, abs), sha256: sha256(buf), bytes: buf.length }, this.source("hook"), t.state);
-      this.current?.written.push(a.id);
+      const rel = relative(this.host.cwd, abs);
+      try {
+        const a = this.host.artifacts.upsertFile(t.kind, { path: rel, sha256: sha256(buf), bytes: buf.length }, this.source("hook"), t.state);
+        this.current?.written.push(a.id);
+      } catch (e) {
+        // 文件已经写出，没法退回给 agent；不登记，留事件供观测
+        this.host.emit({ type: "artifact:rejected", kind: t.kind, path: rel, reason: e instanceof Error ? e.message : String(e), by: "hook", taskId: this.current?.taskId });
+      }
       return;
     }
   }

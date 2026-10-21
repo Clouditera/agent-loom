@@ -1,6 +1,6 @@
 # agent-loom 接口与用法
 
-> 标 **★** 的是池的输入/输出契约（reads / writes）相关接口。
+> 标 **★** 的是池的输入 / 输出契约（reads / writes）相关接口。所有接口都有测试（`npm test`，35 个用例，用假模型跑）。
 
 ---
 
@@ -14,7 +14,7 @@
 | 任务 | `pool.run` | 一次提示词跑一个完整 turn，全程只持有一份许可，失败时任务内重试 |
 | 上下文 | `session.digest` / `session.compress` / `session.fork` | 旁路摘要、原位压缩、分叉继承 |
 | 产物 | `run.artifacts.*` / agent 的 `artifact` 工具 / 文件钩子 | 驱动下游的东西必须登记 |
-| 编排 | `run.step` / `run.parallel` / `pool.consume` | 先后用 await，并列用 parallel，接力靠状态 |
+| 编排 | `run.step` / `run.loop` / `run.parallel` / `pool.consume` | 先后用 await，并列用 parallel，接力靠状态；循环有零件 |
 | 观测 | `run.stats` / `state.json` / `run.on` / `ledger.jsonl` | 一个接口、一个文件看全局 |
 | 测试 | `fauxRuntime` | 假模型，不需要凭证 |
 
@@ -71,8 +71,9 @@ interface PoolOptions {
 interface WriteSpec { kind: string; state?: string | string[] }   // ★ state 不填 = 该类型任意状态
 
 pool.setConcurrency(n)
-run.graph(): { edges: Edge[]; warnings: string[] }               // ★ 由 reads/writes 对出来的链路
+run.graph(): { edges: Edge[]; warnings: string[]; terminal: string[] }   // ★ 由 reads/writes 对出来的链路
 interface Edge { from: string; to: string; kind: string; state: string; backlog: number }
+// warnings：有池读、没有池声明写；terminal：有池写、没有池读（通常是终态）
 ```
 
 **用法**
@@ -89,13 +90,14 @@ const check = run.pool("check", { needs: { llm: 1, sandbox: 1 }, concurrency: 2,
 
 run.graph();
 // edges:    [{ from: "find", to: "check", kind: "item", state: "new", backlog: 3 }]
-// warnings: ["item:checked 有池写、没有池读"]
+// warnings: []
+// terminal: ["check → item:checked", "check → item:rejected"]
 ```
 
 **★ 声明 reads / writes 之后 SDK 会做的事**
 
 1. **启动时连线并检查**：`run.graph()` 和 state.json 里都能看到链路。读了却没人写、写了却没人读，只给提示，不报错，因为也可能是代码在外面投放或在外面收取。
-2. **写入校验**：本池的任务（不论通过工具、钩子还是 consume 里的代码）写出未声明的类型或状态时，直接报错。报错是 agent 看得懂的说明。不声明 writes 的池不做校验。
+2. **写入校验**：本池的任务（不论通过工具、钩子还是 consume 里的代码）写出未声明的类型或状态时，直接报错，报错是 agent 看得懂的说明。只改字段、不改状态时，本池读或写的类型都放行。不声明 writes 的池不做校验；池外的代码（比如串行段里）也不受限制。
 3. **告诉 agent 这一步要产出什么**：同一个会话可能先后在不同池里跑，所以产物工具按“当前任务所在的池”动态校验。SDK 还会在任务提示词末尾自动附一行「本步骤需登记的产出：item（checked / rejected）」，用 `TaskOptions.outputHint: false` 可以关掉。
 
 **调度规则（固定行为）**
@@ -257,6 +259,7 @@ createRun({ trackFiles: [{ dir: "out/patches", kind: "patch", state: "new" }] })
 - 同一路径只对应一条产物，内容变化时版本 +1。
 - 目录外的草稿不登记。
 - 用 bash 写出的文件不会被捕捉，需要用工具或代码自己登记。
+- ★ 所在池没声明这种产出时：文件已经写出、退不回去，所以不登记，只发一个 `artifact:rejected` 事件。
 
 ---
 
@@ -265,6 +268,10 @@ createRun({ trackFiles: [{ dir: "out/patches", kind: "patch", state: "new" }] })
 ```ts
 run.step<T>(name, fn: () => Promise<T>): Promise<T>
 // 串行记账：之前的运行里已完成 → 直接返回记下的结果（需可 JSON 序列化）；循环轮次用 step(`round-${i}`)
+
+run.loop<T>(name, { max, until? }, body: (round) => Promise<T>): Promise<{ rounds; results: T[]; stopped: "until" | "max" }>
+// 循环零件：目标（body）+ 判定（until：还要不要再来一轮）+ 上限（max）
+// 每轮自动用 step 记账；续跑时已完成的轮次取回结果、用同一个 until 重新判定，从下一轮接着跑
 
 run.parallel([job1, job2, ...]): Promise<[...results]>
 // 并列：任一作业失败 → run 进入停止，等全部收尾后抛出第一个错误
@@ -285,7 +292,7 @@ interface ConsumeReport { pool; handled; failed; stalled: string[] }
 const brief = await run.step("init", async () => (await find.run(await run.session("init", R), "…")).output);
 
 await run.parallel([
-  async () => { for (let i = 1; i <= 3; i++) await run.step(`find-${i}`, () => find.run(…)); },   // 循环生产者
+  () => run.loop("find", { max: 3, until: (r) => r.output.includes("没有更多") }, (i) => find.run(…)),   // 循环生产者
   () => check.consume({ handle: async (item) => {
           const s = await run.session(`check-${item.id}`, R);
           await check.run(s, `复核 ${JSON.stringify(item.fields)}`);   // agent 用 artifact 工具把 item 改成 checked/rejected
@@ -314,7 +321,7 @@ await run.parallel([
 
 ```ts
 run.stats()     // { runId, status, quiescent, capacities, pools, graph★, tasks: {running, recent}, artifacts, sessions, steps, events }
-run.on(e => …)  // 事件：capacity:grant|release / task:start|retry|end / artifact:write / summary / fork / step / consumer:item-failed / run:stopping
+run.on(e => …)  // 事件：capacity:grant|release / task:start|retry|end / artifact:write|rejected / summary / fork / step / consumer:item-failed / run:stopping
 ```
 
 - `workdir/state.json`：`stats()` 的落盘版，约 300ms 刷新一次。外部只读这一个文件就能看全局。
@@ -350,12 +357,10 @@ faux.setResponses([
 
 ---
 
-## 12. 本版要落实的改动（相对 v0 代码）
+## 12. 当前边界（已知、有意为之）
 
-1. `PoolOptions` 新增 `reads`、`writes`；`consume` 的 `reads` 改为可选（默认取池上的）。
-2. 新增 `run.graph()`；`stats()` 和 state.json 增加 `graph` 字段（链路 + 每段积压）。
-3. 声明了 writes 的池做写入校验，三个入口（工具、钩子、代码）都校验。
-4. 产物工具按当前任务所在池的 writes 动态校验；任务提示词末尾自动附产出要求（`outputHint`，可关）。
-5. README、示例、测试同步更新。
-
-v0 的边界不变：单进程；文件钩子只看 write / edit；摘要过容量门但不算 Task；没做速率 / 预算型资源、汇合原语、会话间通信、人工确认。
+- **单进程**：产物存储和会话锁都在进程内，不支持多个进程同时跑同一个 workdir。
+- **文件钩子只看 write / edit**：bash 写出的文件要自己登记。
+- **摘要的定位**：摘要过容量门（占模型名额），但不进池、不算 Task。
+- **一个池最多一个模型容量**：Task 用的模型就是它。
+- **没做**：速率 / 预算型资源、汇合原语、会话间通信、人工确认。

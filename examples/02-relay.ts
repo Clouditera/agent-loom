@@ -37,10 +37,11 @@ run.on((e) => {
 
 // 资源：一个模型，最多 3 路并发（真闸门）
 run.capacity("llm", { model: real ?? "faux/m1", concurrency: 3 });
-// 池：只限流；priority 越小越下游越优先
-const produce = run.pool("produce", { needs: "llm", concurrency: 1, priority: 50 });
-const check = run.pool("check", { needs: "llm", concurrency: 2, priority: 30 });
-const finish = run.pool("finish", { needs: "llm", concurrency: 2, priority: 10 });
+// 池：只限流；priority 越小越下游越优先；reads / writes 声明输入输出 → 链路一眼可见，写错会被拦下
+const produce = run.pool("produce", { needs: "llm", concurrency: 1, priority: 50, writes: { kind: "item", state: "new" } });
+const check = run.pool("check", { needs: "llm", concurrency: 2, priority: 30, reads: { kind: "item", state: "new" }, writes: { kind: "item", state: "checked" } });
+const finish = run.pool("finish", { needs: "llm", concurrency: 2, priority: 10, reads: { kind: "item", state: "checked" }, writes: { kind: "item", state: "done" } });
+console.log("链路:", run.graph().edges.map((e) => `${e.from} →(${e.kind}:${e.state})→ ${e.to}`).join("  "));
 
 // 可选：给类型加约束（SDK 只校验，不解释含义）
 run.artifacts.defineKind("item", { states: ["new", "checked", "done"], transitions: { new: ["checked"], checked: ["done"] } });
@@ -55,20 +56,16 @@ const brief = await run.step("prepare", async () => {
 });
 console.log("目标:", brief);
 
-// 并列段：生产者 + 两个消费池同时跑
+// 并列段：生产者（循环零件：最多 3 轮，每轮自动记账）+ 两个消费池同时跑
 await run.parallel([
-  async () => {
-    for (let round = 1; round <= 3; round++) {
-      await run.step(`produce-round-${round}`, async () => {
-        const s = await run.session(`producer-r${round}`, worker);
-        await produce.run(s, `第 ${round} 轮：提出两个待办。`);
-        for (let k = 1; k <= 2; k++) run.artifacts.create("item", { fields: { round, k } });
-      });
-    }
-  },
+  () =>
+    run.loop("produce", { max: 3 }, async (round) => {
+      const s = await run.session(`producer-r${round}`, worker);
+      await produce.run(s, `第 ${round} 轮：提出两个待办。`);
+      for (let k = 1; k <= 2; k++) run.artifacts.create("item", { fields: { round, k } });
+    }),
   () =>
     check.consume({
-      reads: { kind: "item", state: "new" },
       handle: async (item) => {
         const s = await run.session(`check-${item.id}`, worker);
         await check.run(s, `检查待办 ${JSON.stringify(item.fields)} 是否合理。`);
@@ -77,7 +74,6 @@ await run.parallel([
     }),
   () =>
     finish.consume({
-      reads: { kind: "item", state: "checked" },
       handle: async (item) => {
         const s = await run.session(`finish-${item.id}`, worker);
         await finish.run(s, `完成待办 ${JSON.stringify(item.fields)}。`);

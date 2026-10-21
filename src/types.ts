@@ -31,6 +31,35 @@ export interface PoolOptions {
   concurrency: number;
   /** 默认优先级（越小越优先，表示越下游） */
   priority?: Priority;
+  /** 输入：从哪种 类型+状态 取活（consume 默认用它） */
+  reads?: ArtifactSelector;
+  /** 输出：本池会写出哪些 类型(+状态)。声明了就校验：本池任务写出未声明的类型/状态会报错 */
+  writes?: WriteSpec | WriteSpec[];
+}
+
+/** 输出声明：state 不填 = 该类型任意状态 */
+export interface WriteSpec {
+  kind: string;
+  state?: string | string[];
+}
+
+/** 由各池 reads / writes 对出来的一段链路 */
+export interface GraphEdge {
+  from: string;
+  to: string;
+  kind: string;
+  /** "*" = 任意状态 */
+  state: string;
+  /** 这一段此刻积压了多少条（匹配下游 reads 的产物数） */
+  backlog: number;
+}
+
+export interface PoolGraph {
+  edges: GraphEdge[];
+  /** 有池读、没有池声明写（若由池外代码投放可忽略） */
+  warnings: string[];
+  /** 有池写、没有池读：通常是终态产出 */
+  terminal: string[];
 }
 
 // ---------------------------------------------------------------- 角色 / 任务
@@ -65,6 +94,8 @@ export interface TaskOptions {
   signal?: AbortSignal;
   /** 便于观测的短标签 */
   label?: string;
+  /** 池声明了 writes 时，在提示词末尾附「本步骤需登记的产出」，默认 true */
+  outputHint?: boolean;
 }
 
 export interface TaskResult {
@@ -209,6 +240,7 @@ export type RunEvent =
   | { type: "task:retry"; taskId: string; pool: string; attempt: number; reason: string }
   | { type: "task:end"; taskId: string; pool: string; status: "done" | "failed" | "aborted"; attempts: number; ms: number; error?: string }
   | { type: "artifact:write"; id: string; kind: string; state: string; prev?: string; by: ArtifactSource["by"] }
+  | { type: "artifact:rejected"; kind: string; path?: string; reason: string; by: ArtifactSource["by"]; taskId?: string }
   | { type: "summary"; session: string; tasks: string[]; mode: "digest" | "compress"; reused: boolean }
   | { type: "fork"; parent: string; child: string; inherit: string }
   | { type: "step"; name: string; status: "skipped" | "done" | "failed" }
