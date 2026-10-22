@@ -1,6 +1,6 @@
 # agent-loom 接口与用法
 
-> 标 **★** 的是池的输入 / 输出契约（reads / writes）相关接口。所有接口都有测试（`npm test`，40 个用例，用假模型跑）。
+> 标 **★** 的是池的输入 / 输出契约（reads / writes）相关接口。所有接口都有测试（`npm test`，41 个用例，用假模型跑）。
 
 ---
 
@@ -10,7 +10,7 @@
 |---|---|---|
 | 运行 | `createRun` / `run.close` / `run.stop` / `run.abort` | 一次运行；同一 workdir 再启动就是续跑 |
 | 资源与池 | `run.capacity` / `run.pool` ★reads/writes / `run.graph` ★ | 容量是真闸门，池只限流；池声明读什么、写什么 |
-| 角色与会话 | `AgentRole`（`pi` 直通）/ `run.session` / `session.tasks` | 会话 = 一个 pi 会话文件 + 一个角色；角色的 agent 能力全部直通 pi |
+| 角色与会话 | `AgentRole`（声明资产 + `pi` 直通）/ `run.session` / `session.tasks` | 会话 = 一个 pi 会话文件 + 一个角色；pi 自动发现全关，资产由 workflow 声明 |
 | 任务 | `pool.run` | 一次提示词跑一个完整 turn，全程只持有一份许可，失败时任务内重试 |
 | 上下文 | `session.digest` / `session.compress` / `session.fork` | 旁路摘要、原位压缩、分叉继承 |
 | 产物 | `run.artifacts.*` / agent 的 `artifact` 工具 / 文件钩子 | 驱动下游的东西必须登记 |
@@ -112,19 +112,24 @@ run.graph();
 interface AgentRole {
   name: string;
   system: string;                         // 系统提示词（见下方「system 放在哪」）
-  pi?: PiAgentOptions | ((ctx: { model; sessionName }) => PiAgentOptions | Promise<PiAgentOptions>);
-  tools?: string[];                       // 便捷写法，并入 pi.tools
-  customTools?: ToolDefinition[];         // 便捷写法，并入 pi.customTools
+
+  // 资产：pi 的自动发现全关，只用这里声明的
+  skills?: AssetPath[];                   // SKILL.md 所在目录，或装着多个 skill 的父目录
+  extensions?: (AssetPath | ExtensionFactory)[];   // 扩展文件 / 目录 / 包源，或内联工厂 (pi) => void
+  prompts?: AssetPath[];                  // 提示词模板 .md 文件或目录；任务里发 /名字 会展开
+  context?: (AssetPath | { name: string; content: string })[];   // 上下文文件（等同 AGENTS.md）
+
+  // 工具
+  tools?: string[];                       // 白名单：内置工具、扩展注册的工具都写这里
+  customTools?: ToolDefinition[];         // 自定义工具；和产物工具一起自动并入白名单
   artifactTool?: boolean | { kinds?: string[] };   // 注入产物工具，默认开
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+  // 其余 pi 选项原样直通（对象，或按模型 / 会话名返回的工厂）
+  pi?: PiAgentOptions | ((ctx: { model; sessionName }) => PiAgentOptions | Promise<PiAgentOptions>);
 }
 
-// = pi 的 CreateAgentSessionOptions 去掉 SDK 接管的键
-//   + pi 的 DefaultResourceLoader 选项（资源发现）
-type PiAgentOptions = Omit<CreateAgentSessionOptions, "sessionManager" | "model" | "modelRuntime"
-                                                     | "thinkingLevel" | "scopedModels" | "agentDir" | "sessionStartEvent">
-                    & ResourceLoaderOptions;   // additionalSkillPaths / additionalExtensionPaths / additionalPromptTemplatePaths /
-                                               // extensionFactories / noSkills / noExtensions / noContextFiles / appendSystemPrompt / *Override …
+type AssetPath = string | URL;   // 绝对路径 / 相对路径（相对进程 cwd）/ file: URL / npm: git: 包源
 
 run.session(name: string, role: AgentRole): Promise<Session>   // 按名字开或复活
 run.getSession(name): Session | undefined
@@ -145,7 +150,36 @@ interface TaskView {
 }
 ```
 
-**角色 = pi 的 agent，SDK 只接管四样**：
+**资产由 workflow 自己声明，pi 的自动发现全关**。下面这些一样都不会自己进来：
+
+| 不再自动发现 | 原本 pi 会从哪找 |
+|---|---|
+| skills | `cwd/.pi/skills`、`.agents/skills`（向上到仓库根）、`~/.agents/skills`、设置里的包 |
+| 扩展 | `cwd/.pi/extensions`、设置里的包 |
+| 提示词模板 | `cwd/.pi/prompts`、设置里的包 |
+| 上下文文件 | 各级 `AGENTS.md` |
+| 系统提示词文件 | `.pi/SYSTEM.md`、`.pi/APPEND_SYSTEM.md` |
+
+`agentDir` 固定为 `workdir/agent`，所以 `~/.pi/agent` 里的个人配置也进不来。声明的路径不存在时，建 agent 时直接报错并指出是哪条。
+
+```ts
+const assets = new URL("./assets/", import.meta.url);   // 资产跟着 workflow 代码走
+const reviewer: AgentRole = {
+  name: "reviewer",
+  system: "你是审阅者……",
+  skills: [new URL("skills/", assets)],
+  extensions: [new URL("ext/lint.ts", assets), (pi) => pi.registerTool(stampTool)],
+  prompts: [new URL("prompts/", assets)],            // 任务里发 /review 会展开成模板
+  context: [new URL("RULES.md", assets), { name: "本次约定", content: "只看 src/ 目录" }],
+  tools: ["read", "grep", "lint", "stamp"],          // lint / stamp 来自上面的扩展
+};
+
+// 同一套资产给多个角色：就是普通对象展开
+const shared = { skills: reviewer.skills, context: reviewer.context };
+const fixer: AgentRole = { ...shared, name: "fixer", system: "……", tools: ["read", "edit", "write"] };
+```
+
+**SDK 接管四样，写进 `pi` 会直接报错**（对象在 `run.session` 时、工厂在建 agent 时）：
 
 | SDK 接管 | 为什么 |
 |---|---|
@@ -154,39 +188,25 @@ interface TaskView {
 | 注入产物工具、订阅事件 | 驱动下游的东西必须能登记；文件钩子靠事件 |
 | 创建时机与释放（`agentDir` / `sessionStartEvent`） | 第一次拿到许可时才创建；`session.dispose()` 释放 |
 
-这几样写进 `pi` 会直接报错（对象在 `run.session` 时、工厂在建 agent 时）。其余全部原样交给 pi：
-扩展、skills、提示词模板、AGENTS.md、`tools` / `excludeTools` / `noTools`、`settingsManager`、`cwd`、MCP……
-pi 以后加的新选项也不用等 SDK 改。
+另外两类也不能写进 `pi`：自动发现开关（`noSkills` / `noExtensions` / `noPromptTemplates` / `noThemes` / `noContextFiles`，SDK 固定全关），
+和 pi 的资产路径（`additionalSkillPaths` / `additionalExtensionPaths` / `additionalPromptTemplatePaths` / `extensionFactories`，改用上面的角色字段）。
 
-**pi 选项怎么分发**：整个 `pi` 对象原样交给 `createAgentSession`，没给 `pi.resourceLoader` 时也原样交给 SDK 创建的 `DefaultResourceLoader`
-（两边都只读自己认识的键）。所以 pi 以后新增的会话 / 资源选项直接可用。
+**其余原样直通**：`excludeTools`、`noTools`、`settingsManager`、`cwd`、`systemPrompt`、`appendSystemPrompt`、`*Override` 钩子……
+整个 `pi` 对象原样交给 `createAgentSession` 和 SDK 创建的 `DefaultResourceLoader`（两边只读自己认识的键），pi 以后新增的选项直接可用。
+
+```ts
+// 按模型 / 会话决定配置（比如每个会话一个工作目录）
+const perSession: AgentRole = { name: "w", system: "...", tools: ["read", "bash"], pi: ({ sessionName }) => ({ cwd: `/work/${sessionName}` }) };
+```
 
 **system 放在哪**：pi 没带基础提示词时，`system` 就是基础提示词；带了（`pi.systemPrompt` 或自己的 `pi.resourceLoader`），
 那个保持原样，`system` 追加在 pi 的追加提示词之后。
 
+**自带 `pi.resourceLoader`**：完全由你的加载器负责资源，SDK 不再干预；这时不能再在角色上声明 skills / extensions / prompts / context。
+
 **两个 pi 的规则要知道**：
 - `tools` 一旦给了就是白名单：扩展注册的工具也要写进去（产物工具和 `customTools` 由 SDK 自动并入）。
 - skills 只有在开了能读文件的工具（如 `read`）时才会列进系统提示词。
-
-**默认会做资源发现**（和 pi 命令行一样）：`cwd` 下的 `.pi/`、`.agents/skills`、AGENTS.md，以及 `~/.agents/skills`。
-`agentDir` 固定为 `workdir/agent`，所以 `~/.pi/agent` 里的个人扩展不会混进来。要完全隔离：
-
-```ts
-const role: AgentRole = {
-  name: "reviewer",
-  system: "你是审阅者……",
-  pi: {
-    tools: ["read", "grep", "lint"],               // lint 来自下面的扩展
-    noSkills: true, noExtensions: true, noContextFiles: true, noPromptTemplates: true,
-    additionalSkillPaths: ["./skills"],            // 只用这里的 skills
-    additionalExtensionPaths: ["./ext/lint.ts"],   // 只加载这个扩展
-    additionalPromptTemplatePaths: ["./prompts"],  // 任务里发 /review 会展开成模板
-  },
-};
-
-// 按模型 / 会话决定配置（比如每个会话一个工作目录）
-const perSession: AgentRole = { name: "w", system: "...", pi: ({ sessionName }) => ({ cwd: `/work/${sessionName}`, tools: ["read", "bash"] }) };
-```
 
 - 会话 = 一个 pi 会话文件（`workdir/sessions/<name>.jsonl`）加一个角色。系统提示词以 system 消息形式落在条目里。
 - 同一会话同一时刻只跑一个 Task，第二个会排队，排队时不占资源。要并发就 `fork`。

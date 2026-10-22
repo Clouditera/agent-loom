@@ -15,6 +15,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { relative, resolve, sep, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Model } from "@earendil-works/pi-ai";
 import { Type } from "@earendil-works/pi-ai";
@@ -25,12 +26,13 @@ import {
   SessionManager,
   SettingsManager,
   type AgentSession,
+  type ExtensionFactory,
   type ResourceLoader,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { ArtifactStore } from "./artifacts.ts";
 import { CYCLE_TYPE, DIGEST_TYPE, cycleData, DEFAULT_SUMMARY_PROMPT, serializeSegment, type CycleData, type EntryLike } from "./serialize.ts";
-import type { AgentRole, ArtifactSource, Digest, ForkOptions, InheritPlan, PiAgentOptions, PiResourceOptions, RunEvent, SummarySpec, TakeMode, TaskView, ThinkingLevel } from "./types.ts";
+import type { AgentRole, ArtifactSource, AssetPath, ContextAsset, Digest, ForkOptions, InheritPlan, PiAgentOptions, PiResourceOptions, RunEvent, SummarySpec, TakeMode, TaskView, ThinkingLevel } from "./types.ts";
 import { ArtifactError } from "./types.ts";
 import { clip, hashText, Mutex, sha256 } from "./util.ts";
 
@@ -302,29 +304,66 @@ export class Session {
   }
 
   /**
-   * 资源加载器：角色给了一个就用它，否则用 pi 的 DefaultResourceLoader（扩展 / skills / 提示词模板 / AGENTS.md），
-   * 整个 pi 选项原样交给它（它只读自己认识的键，pi 以后新增的资源选项也直接生效）。
+   * 资源加载器：pi 的 DefaultResourceLoader，**自动发现全关**，只加载角色声明的资产
+   * （skills / extensions / prompts / context）。其余 pi 资源选项原样交给它。
    * 角色的 system 总是生效：pi 没带基础提示词时它就是基础提示词；带了（systemPrompt 或自己的 resourceLoader）就追加在后。
+   * 自带 resourceLoader = 自己负责全部资源，SDK 不再干预（此时不能再在角色上声明资产）。
    */
   private async resourceLoader(pi: PiAgentOptions, cwd: string, settingsManager: unknown): Promise<ResourceLoader> {
     const given = pi.resourceLoader;
+    const role = this.role;
     if (!given) {
-      const system = this.role.system;
+      const system = role.system;
       const ownBase = pi.systemPrompt !== undefined;
       const userAppend = pi.appendSystemPromptOverride;
+      const userAgents = pi.agentsFilesOverride;
+      const extensions = role.extensions ?? [];
+      const skills = (role.skills ?? []).map(assetPath);
+      const prompts = (role.prompts ?? []).map(assetPath);
+      const extPaths = extensions.filter((e) => typeof e !== "function").map((e) => assetPath(e as AssetPath));
+      const missing = [
+        ...skills.filter(isMissing).map((x) => `skill 路径不存在：${x}`),
+        ...prompts.filter(isMissing).map((x) => `提示词模板路径不存在：${x}`),
+        ...extPaths.filter(isMissing).map((x) => `扩展路径不存在：${x}`),
+      ];
+      if (missing.length) throw new Error(`角色 ${role.name} 的资产加载失败：\n  ${missing.join("\n  ")}`);
+      const declaredContext = { agentsFiles: (role.context ?? []).map((c, i) => readContext(role, c, i)) };
       const loader = new DefaultResourceLoader({
         ...(pi as PiResourceOptions),
         cwd,
         agentDir: join(this.host.workdir, "agent"),
         settingsManager: settingsManager as never,
+        // 自动发现全关：cwd 的 .pi/ 与 .agents/、~/.agents、设置里的包、AGENTS.md、SYSTEM.md / APPEND_SYSTEM.md
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        appendSystemPrompt: pi.appendSystemPrompt ?? [],
+        // 只用声明的资产
+        additionalSkillPaths: skills,
+        additionalPromptTemplatePaths: prompts,
+        additionalExtensionPaths: extPaths,
+        extensionFactories: extensions.filter((e): e is ExtensionFactory => typeof e === "function"),
+        agentsFilesOverride: () => (userAgents ? userAgents(declaredContext) : declaredContext),
         systemPrompt: ownBase ? pi.systemPrompt : system,
         appendSystemPromptOverride:
           ownBase && system ? (base) => [...(userAppend ? userAppend(base) : base), system] : userAppend,
       });
       await loader.reload();
+      const problems = [
+        ...loader.getExtensions().errors.map((e) => `扩展 ${e.path}：${e.error}`),
+        ...loader.getSkills().diagnostics.filter((d) => d.type === "error").map((d) => `skill ${d.path ?? ""}：${d.message}`),
+        ...loader.getPrompts().diagnostics.filter((d) => d.type === "error").map((d) => `提示词模板 ${d.path ?? ""}：${d.message}`),
+      ];
+      if (problems.length) throw new Error(`角色 ${role.name} 的资产加载失败：\n  ${problems.join("\n  ")}`);
       return loader;
     }
-    const system = this.role.system;
+    const declared = (["skills", "extensions", "prompts", "context"] as const).filter((k) => role[k]?.length);
+    if (declared.length) {
+      throw new Error(`角色 ${role.name}：自带 pi.resourceLoader 时，${declared.join(" / ")} 请在你的加载器里提供`);
+    }
+    const system = role.system;
     return {
       getExtensions: () => given.getExtensions(),
       getSkills: () => given.getSkills(),
@@ -523,14 +562,53 @@ export class Session {
 
 /** SDK 接管、角色不能在 pi 里指定的创建选项 */
 const MANAGED_KEYS = ["sessionManager", "model", "modelRuntime", "thinkingLevel", "scopedModels", "agentDir", "sessionStartEvent"] as const;
+/** pi 的自动发现开关：SDK 固定全关 */
+const DISCOVERY_KEYS = ["noExtensions", "noSkills", "noPromptTemplates", "noThemes", "noContextFiles"] as const;
+/** pi 的资产路径：改由角色上的字段声明 */
+const ASSET_KEYS = {
+  additionalSkillPaths: "skills",
+  additionalExtensionPaths: "extensions",
+  extensionFactories: "extensions",
+  additionalPromptTemplatePaths: "prompts",
+} as const;
 
 function assertNoManaged(role: AgentRole, pi: PiAgentOptions): void {
-  const given = MANAGED_KEYS.filter((k) => (pi as Record<string, unknown>)[k] !== undefined);
-  if (!given.length) return;
-  throw new Error(
-    `角色 ${role.name}：pi.${given.join(" / pi.")} 由 SDK 接管，不能在角色里指定` +
-      `（会话文件、模型和思考强度随容量许可分配；换模型请改容量，思考强度用 role.thinking）`,
-  );
+  const has = (k: string) => (pi as Record<string, unknown>)[k] !== undefined;
+  const managed = MANAGED_KEYS.filter(has);
+  if (managed.length) {
+    throw new Error(
+      `角色 ${role.name}：pi.${managed.join(" / pi.")} 由 SDK 接管，不能在角色里指定` +
+        `（会话文件、模型和思考强度随容量许可分配；换模型请改容量，思考强度用 role.thinking）`,
+    );
+  }
+  const discovery = DISCOVERY_KEYS.filter(has);
+  if (discovery.length) {
+    throw new Error(`角色 ${role.name}：pi.${discovery.join(" / pi.")} 不能指定 —— 自动发现由 SDK 固定全关，资产请在角色上声明`);
+  }
+  const assets = Object.keys(ASSET_KEYS).filter(has) as (keyof typeof ASSET_KEYS)[];
+  if (assets.length) {
+    throw new Error(`角色 ${role.name}：${assets.map((k) => `pi.${k} 请改用 role.${ASSET_KEYS[k]}`).join("；")}`);
+  }
+}
+
+/** 资产路径 → 绝对路径（相对路径按进程 cwd 解析；npm: / git: 等包源原样） */
+function assetPath(p: AssetPath): string {
+  if (p instanceof URL) return fileURLToPath(p);
+  if (PACKAGE_SOURCE.test(p)) return p;
+  return resolve(p);
+}
+
+const PACKAGE_SOURCE = /^(npm|git|github|gitlab|https?|ssh):/;
+
+function isMissing(p: string): boolean {
+  return !PACKAGE_SOURCE.test(p) && !existsSync(p);
+}
+
+function readContext(role: AgentRole, c: ContextAsset, i: number): { path: string; content: string } {
+  if (typeof c === "object" && !(c instanceof URL)) return { path: c.name || `context-${i + 1}`, content: c.content };
+  const file = assetPath(c);
+  if (!existsSync(file)) throw new Error(`角色 ${role.name}：上下文文件不存在：${file}`);
+  return { path: file, content: readFileSync(file, "utf8") };
 }
 
 function isContextEntry(e: EntryLike): boolean {

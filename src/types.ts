@@ -3,7 +3,7 @@
  */
 
 import type { Model } from "@earendil-works/pi-ai";
-import type { CreateAgentSessionOptions, CreateAgentSessionServicesOptions, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { CreateAgentSessionOptions, CreateAgentSessionServicesOptions, ExtensionFactory, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -72,28 +72,50 @@ export interface PoolGraph {
 type ManagedOptions = "sessionManager" | "model" | "modelRuntime" | "thinkingLevel" | "scopedModels" | "agentDir" | "sessionStartEvent";
 
 /**
- * 资源发现选项：SDK 用它们构造 pi 的 DefaultResourceLoader（不传 resourceLoader 时）。
- * 等同于 pi 自己的 CreateAgentSessionServicesOptions.resourceLoaderOptions，再去掉 systemPrompt。
+ * 资源加载选项（不传 resourceLoader 时，SDK 用它们构造 pi 的 DefaultResourceLoader）。
+ * 去掉了自动发现开关和资产路径：自动发现由 SDK 全关，资产在角色上声明（skills / extensions / prompts / context）。
  */
-export type PiResourceOptions = NonNullable<CreateAgentSessionServicesOptions["resourceLoaderOptions"]>;
+export type PiResourceOptions = Omit<
+  NonNullable<CreateAgentSessionServicesOptions["resourceLoaderOptions"]>,
+  DiscoveryOptions | AssetOptions
+>;
+
+/** pi 的自动发现开关 —— SDK 固定全关，不能改 */
+type DiscoveryOptions = "noExtensions" | "noSkills" | "noPromptTemplates" | "noThemes" | "noContextFiles";
+/** pi 的资产路径 —— 改由角色上的 skills / extensions / prompts 声明 */
+type AssetOptions = "additionalExtensionPaths" | "additionalSkillPaths" | "additionalPromptTemplatePaths" | "extensionFactories";
 
 /**
- * 可以原样交给 pi 的创建选项（去掉 SDK 接管的那几样），外加资源发现选项：
- * additionalSkillPaths / additionalExtensionPaths / extensionFactories / noSkills / noContextFiles …
+ * 可以原样交给 pi 的选项：createAgentSession 的选项（去掉 SDK 接管的）+ 资源加载选项
+ * （systemPrompt / appendSystemPrompt / *Override 钩子 / eventBus …）。
  */
 export type PiAgentOptions = Omit<CreateAgentSessionOptions, ManagedOptions> & PiResourceOptions;
 
+/** 资产路径：绝对路径、相对路径（相对进程 cwd）、file: URL（如 new URL("./skills", import.meta.url)），或 npm: / git: 包源 */
+export type AssetPath = string | URL;
+
+/** 上下文文件（等同 AGENTS.md）：给路径就读文件，或直接给内容 */
+export type ContextAsset = AssetPath | { name: string; content: string };
+
 export interface AgentRole {
   name: string;
-  /** 系统提示词：作为 pi 的 systemPrompt；若 pi.resourceLoader 自带提示词，这段会追加在其后 */
+  /** 系统提示词：pi 没带基础提示词时它就是基础提示词；带了（pi.systemPrompt / pi.resourceLoader）就追加在后 */
   system: string;
-  /**
-   * 直通 pi 的创建选项：resourceLoader（扩展 / skills / 提示词模板 / AGENTS.md / 系统提示词追加）、
-   * tools / excludeTools / customTools、settingsManager、cwd…… 原样使用。
-   * SDK 只覆盖：会话文件、模型、注入产物工具、创建时机。
-   */
-  pi?: PiAgentOptions | ((ctx: { model: Model<any>; sessionName: string }) => PiAgentOptions | Promise<PiAgentOptions>);
-  /** 便捷写法：要开哪些 pi 内置工具，等价于塞进 pi.tools */
+
+  // ---- 资产：pi 的自动发现（cwd 的 .pi/ .agents/、~/.agents、AGENTS.md、APPEND_SYSTEM.md…）全关，只用这里声明的
+
+  /** skills：SKILL.md 所在目录，或包含多个 skill 目录的父目录 */
+  skills?: AssetPath[];
+  /** 扩展：扩展文件 / 目录 / 包源，或内联的扩展工厂 (pi) => void */
+  extensions?: Array<AssetPath | ExtensionFactory>;
+  /** 提示词模板：.md 文件或目录；任务里发 /名字 会展开 */
+  prompts?: AssetPath[];
+  /** 上下文文件（等同 AGENTS.md），按顺序放进系统提示词 */
+  context?: ContextAsset[];
+
+  // ---- 工具
+
+  /** 要开哪些工具（白名单）：pi 内置工具、扩展注册的工具都写这里；产物工具和 customTools 自动并入 */
   tools?: string[];
   /** 额外自定义工具；和 pi.customTools 合并 */
   customTools?: ToolDefinition<any, any, any>[];
@@ -101,6 +123,12 @@ export interface AgentRole {
   artifactTool?: boolean | { kinds?: string[] };
   /** 思考强度；不填用容量上模型串里的，再不填 "medium" */
   thinking?: ThinkingLevel;
+
+  /**
+   * 其余 pi 选项原样直通：excludeTools、settingsManager、cwd、systemPrompt、appendSystemPrompt、*Override 钩子……
+   * 也可以是工厂，按当前模型 / 会话名决定。SDK 接管的（会话文件、模型、思考强度、agentDir）和自动发现开关不能写。
+   */
+  pi?: PiAgentOptions | ((ctx: { model: Model<any>; sessionName: string }) => PiAgentOptions | Promise<PiAgentOptions>);
 }
 
 export interface RetryPolicy {

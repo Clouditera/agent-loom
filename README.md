@@ -8,7 +8,7 @@ A lightweight agent workflow SDK based on the pi SDK — session context reuse, 
 
 ```bash
 npm install                      # 或：bash scripts/link-pi.sh（把全局安装的 pi 链进 node_modules）
-npm test                         # 40 个测试，假模型，约 8 秒
+npm test                         # 41 个测试，假模型，约 8 秒
 node examples/01-context.ts      # 上下文：摘要 / 原文继承 / 摘要继承 / 换角色
 node examples/02-relay.ts        # 并行：生产者 + 两个消费池接力；再跑一次看续跑
 ```
@@ -24,7 +24,7 @@ node examples/02-relay.ts        # 并行：生产者 + 两个消费池接力；
 | Run | `createRun({ workdir, cwd })` | 一次运行；同一 `workdir` 再启动就是续跑 |
 | 资源 / 容量 | `run.capacity(name, { model?, concurrency })` | 真闸门。带 `model` 是模型容量，不带是普通资源（比如沙箱机位） |
 | 池 | `run.pool(name, { needs, concurrency, priority, reads, writes })` | 只限流，并声明输入 / 输出。真实并发 = min(池, 容量)；`priority` 越小越下游、越优先 |
-| Agent 角色 | `{ name, system, pi?, tools?, thinking? }` | `pi` 原样交给 pi 的 `createAgentSession`（扩展 / skills / 提示词模板 / AGENTS.md / 工具……）；SDK 只接管会话文件、模型、产物工具、创建时机 |
+| Agent 角色 | `{ name, system, skills?, extensions?, prompts?, context?, tools?, pi? }` | 资产自己声明（pi 自动发现全关）；其余 `pi` 选项原样直通；SDK 只接管会话文件、模型、产物工具、创建时机 |
 | Session | `run.session(name, role)` | 一个 pi 会话文件；按名字复活 |
 | Task | `pool.run(session, prompt, opts)` | 一次提示词跑一个完整 turn，全程只持有一份许可 |
 | 消费者 | `pool.consume({ handle })` | 按池的 `reads` 从持久状态取活，不看上游；全局静默时返回 |
@@ -63,25 +63,24 @@ await run.parallel([
 await run.close();
 ```
 
-## Agent 角色：能力全部直通 pi
+## Agent 角色：资产自己声明，其余直通 pi
 
-SDK 不重做 agent 能力。`role.pi` 原样交给 pi 的 `createAgentSession` / `DefaultResourceLoader`，SDK 只接管四样：**会话文件、模型（随容量许可）、产物工具注入与事件、创建时机**；这几样写进 `pi` 会直接报错。
+pi 的自动发现（`cwd` 的 `.pi/`、`.agents/skills`、`~/.agents/skills`、AGENTS.md、SYSTEM.md / APPEND_SYSTEM.md、设置里的包）**全关**。workflow 用到的 skill、扩展、提示词模板、上下文文件都在角色上声明，跟着 workflow 代码走，换台机器、换个目标仓库，行为都一样。
 
 ```ts
+const assets = new URL("./assets/", import.meta.url);
 const reviewer: AgentRole = {
   name: "reviewer",
   system: "你是审阅者……",
-  pi: {
-    tools: ["read", "grep", "lint"],               // 白名单；lint 来自下面的扩展
-    additionalExtensionPaths: ["./ext/lint.ts"],
-    additionalSkillPaths: ["./skills"],
-    additionalPromptTemplatePaths: ["./prompts"],  // 任务里发 /review 会展开成模板
-    noContextFiles: true,                          // 其余默认发现（AGENTS.md 等）可按需关
-  },
+  skills:     [new URL("skills/", assets)],
+  extensions: [new URL("ext/lint.ts", assets)],      // 也可以写内联工厂 (pi) => { … }
+  prompts:    [new URL("prompts/", assets)],         // 任务里发 /review 会展开成模板
+  context:    [new URL("RULES.md", assets)],         // 等同 AGENTS.md
+  tools:      ["read", "grep", "lint"],              // 白名单；lint 来自上面的扩展
 };
 ```
 
-`pi` 也可以是工厂 `({ model, sessionName }) => options`，按会话决定配置。细则见 [docs/API.md §3](docs/API.md)。
+其余 pi 选项放 `role.pi` 原样直通（也可以是工厂 `({ model, sessionName }) => options`）。SDK 只接管四样：**会话文件、模型（随容量许可）、产物工具注入与事件、创建时机**，这几样和自动发现开关写进 `pi` 会直接报错。细则见 [docs/API.md §3](docs/API.md)。
 
 ## ① 上下文
 
@@ -162,7 +161,7 @@ src/
   serialize.ts  按摘要程度序列化任务段；默认摘要提示词
   types.ts      公共类型与错误
   testing.ts    假模型 runtime（不需要凭证）
-test/           sched / artifacts / session / run / contract / agent 六组，40 个用例
+test/           sched / artifacts / session / run / contract / agent 六组，41 个用例
 examples/       01-context、02-relay
 ```
 
