@@ -298,6 +298,7 @@ export type RunEvent =
   | { type: "fork"; parent: string; child: string; inherit: string }
   | { type: "step"; name: string; status: "skipped" | "done" | "failed" }
   | { type: "consumer:item-failed"; pool: string; item: string; error: string }
+  | { type: "extension:error"; session: string; extension: string; event: string; error: string }
   | { type: "run:stopping"; reason: string };
 
 export type TimedEvent = RunEvent & { ts: number };

@@ -191,3 +191,113 @@ test("自带 resourceLoader：原样使用、role.system 追加在后；同时�
   await assert.rejects(() => p.run(s, "go"), /自带 pi\.resourceLoader 时，skills 请在你的加载器里提供/);
   await closeAll(run);
 });
+
+// ---------------------------------------------------------------- 扩展生命周期（session_start / session_shutdown）
+
+/** 仿 MCP：加载期什么工具都不注册，session_start 时才「连上服务器」注册工具；session_shutdown 时断开 */
+function fakeMcp(log: string[]) {
+  return (api: ExtensionAPI) => {
+    api.on("session_start", async (e) => {
+      log.push(`start:${e.reason}${e.previousSessionFile ? ":prev" : ""}`);
+      await new Promise((r) => setTimeout(r, 10)); // 模拟连接耗时
+      api.registerTool({
+        name: "mcp_echo",
+        label: "mcp_echo",
+        description: "echo from fake mcp",
+        parameters: Type.Object({ v: Type.String() }),
+        execute: async (_id, p) => ({ content: [{ type: "text", text: `mcp 回声 ${p.v}` }], details: {} }),
+      });
+    });
+    api.on("session_shutdown", async (e) => {
+      log.push(`shutdown:${e.reason}`);
+    });
+  };
+}
+
+test("扩展生命周期：session_start 在第一个任务前触发，里面注册的工具当场可用；run.close 发 session_shutdown", async () => {
+  const { run, faux } = await mkRun("ext-lifecycle");
+  const log: string[] = [];
+  const role: AgentRole = { name: "m", system: "S", extensions: [fakeMcp(log)], tools: ["mcp_echo"] };
+  const p = run.pool("p", { needs: "m", concurrency: 1 });
+  const s = await run.session("s", role);
+  let ctx: any;
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("mcp_echo", { v: "hi" })], { stopReason: "toolUse" }),
+    (c: any) => ((ctx = c), fauxAssistantMessage("ok")),
+    ...replies(1),
+  ]);
+  await p.run(s, "go", { outputHint: false });
+  assert.deepEqual(log, ["start:startup"], "session_start 只发一次，原因 startup");
+  assert.ok(msgs(ctx).some((m) => /toolResult:mcp 回声 hi/.test(m)), msgs(ctx).join("\n"));
+  await p.run(s, "again", { outputHint: false });
+  assert.deepEqual(log, ["start:startup"], "同一会话第二个任务不重复触发");
+  await closeAll(run);
+  assert.deepEqual(log, ["start:startup", "shutdown:quit"]);
+});
+
+test("扩展生命周期：分叉子会话发 fork（带上游文件）；同一 workdir 续跑时发 resume", async () => {
+  const dir = tmpDir("ext-resume");
+  const log: string[] = [];
+  const role: AgentRole = { name: "m", system: "S", extensions: [fakeMcp(log)] };
+  {
+    const { run, faux } = await mkRun("x", { workdir: dir });
+    const p = run.pool("p", { needs: "m", concurrency: 1 });
+    faux.setResponses(replies(2));
+    const s = await run.session("s", role);
+    await p.run(s, "go");
+    const child = await s.fork({ name: "child" });
+    await p.run(child, "child go");
+    await closeAll(run);
+  }
+  assert.deepEqual(log.filter((l) => l.startsWith("start")), ["start:startup", "start:fork:prev"]);
+  log.length = 0;
+  {
+    const { run, faux } = await mkRun("x", { workdir: dir });
+    const p = run.pool("p", { needs: "m", concurrency: 1 });
+    faux.setResponses(replies(1));
+    await p.run(await run.session("s", role), "resume go");
+    await closeAll(run);
+  }
+  assert.deepEqual(log, ["start:resume", "shutdown:quit"]);
+});
+
+test("扩展生命周期：扩展处理器抛错不打断任务，变成 extension:error 事件", async () => {
+  const { run, faux } = await mkRun("ext-error");
+  const errors: any[] = [];
+  run.on((e) => e.type === "extension:error" && errors.push(e));
+  const role: AgentRole = {
+    name: "m",
+    system: "S",
+    extensions: [
+      (api: ExtensionAPI) => {
+        api.on("session_start", () => {
+          throw new Error("连不上服务器");
+        });
+      },
+    ],
+  };
+  const p = run.pool("p", { needs: "m", concurrency: 1 });
+  faux.setResponses(replies(1));
+  const r = await p.run(await run.session("s", role), "go");
+  assert.equal(r.output, "ok");
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].session, "s");
+  assert.equal(errors[0].event, "session_start");
+  assert.match(errors[0].error, /连不上服务器/);
+  await closeAll(run);
+});
+
+test("扩展生命周期：session_start 里注册的工具也能用通配符放进白名单（如 MCP 的 mcp__*）", async () => {
+  const { run, faux } = await mkRun("ext-pattern");
+  const log: string[] = [];
+  const p = run.pool("p", { needs: "m", concurrency: 1 });
+  const s = await run.session("s", { name: "m", system: "S", extensions: [fakeMcp(log)], tools: ["mcp_*"] });
+  let ctx: any;
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("mcp_echo", { v: "x" })], { stopReason: "toolUse" }),
+    (c: any) => ((ctx = c), fauxAssistantMessage("ok")),
+  ]);
+  await p.run(s, "go", { outputHint: false });
+  assert.ok(msgs(ctx).some((m) => /toolResult:mcp 回声 x/.test(m)), msgs(ctx).join("\n"));
+  await closeAll(run);
+});

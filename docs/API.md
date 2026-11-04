@@ -1,6 +1,6 @@
 # agent-loom 接口与用法
 
-> 标 **★** 的是池的输入 / 输出契约（reads / writes）相关接口。所有接口都有测试（`npm test`，41 个用例，用假模型跑）。
+> 标 **★** 的是池的输入 / 输出契约（reads / writes）相关接口。所有接口都有测试（`npm test`，45 个用例，用假模型跑）。
 
 ---
 
@@ -45,7 +45,7 @@ run.id / run.workdir / run.cwd
 run.stop(reason)      // 平稳停止：不再派新活，在跑的跑完
 run.abort(reason?)    // 立即中止：停止 + 打断在跑的任务
 run.stopping          // 是否已进入停止
-run.close()           // 释放所有 pi 会话，写最终状态（会话文件保留）
+await run.close()     // 释放所有 pi 会话（先给扩展发 session_shutdown），写最终状态（会话文件保留）
 ```
 
 ---
@@ -139,7 +139,7 @@ session.tasks(): TaskView[]           // 当前路径上跑过的任务（按周
 session.task(taskId): TaskView | undefined
 session.contextUsage()                // { tokens, contextWindow, percent }
 session.entries()                     // 原始条目（调试或自定义处理用）
-session.dispose()                     // 释放 pi 资源，会话文件保留
+await session.dispose()               // 先发 session_shutdown 让扩展收尾（最多等 5 秒），再释放；会话文件保留
 
 interface TaskView {
   taskId: string; label?: string;
@@ -186,7 +186,7 @@ const fixer: AgentRole = { ...shared, name: "fixer", system: "……", tools: ["
 | 会话文件（`sessionManager`） | 周期标记、摘要、压缩、分叉、续跑都建在它上面 |
 | 模型（`model` / `modelRuntime` / `thinkingLevel` / `scopedModels`） | 模型随容量许可分配；换模型改容量，思考强度用 `role.thinking` |
 | 注入产物工具、订阅事件 | 驱动下游的东西必须能登记；文件钩子靠事件 |
-| 创建时机与释放（`agentDir` / `sessionStartEvent`） | 第一次拿到许可时才创建；`session.dispose()` 释放 |
+| 创建时机与释放（`agentDir` / `sessionStartEvent`） | 第一次拿到许可时才创建并绑定扩展（发 `session_start`）；`session.dispose()` / `run.close()` 发 `session_shutdown` 后释放 |
 
 另外两类也不能写进 `pi`：自动发现开关（`noSkills` / `noExtensions` / `noPromptTemplates` / `noThemes` / `noContextFiles`，SDK 固定全关），
 和 pi 的资产路径（`additionalSkillPaths` / `additionalExtensionPaths` / `additionalPromptTemplatePaths` / `extensionFactories`，改用上面的角色字段）。
@@ -201,6 +201,16 @@ const perSession: AgentRole = { name: "w", system: "...", tools: ["read", "bash"
 
 **system 放在哪**：pi 没带基础提示词时，`system` 就是基础提示词；带了（`pi.systemPrompt` 或自己的 `pi.resourceLoader`），
 那个保持原样，`system` 追加在 pi 的追加提示词之后。
+
+**扩展生命周期**（和 pi 命令行一致）：
+
+| 时机 | 扩展收到 | 备注 |
+|---|---|---|
+| 会话第一次跑任务、建好 agent 后 | `session_start`，然后 `resources_discover` | MCP 在这里连服务器、注册工具，第一个任务就能用。`reason`：新会话 `startup`；分叉出来、还没跑过任务的子会话 `fork`（带 `previousSessionFile`）；文件里已有对话（续跑 / 释放后再用）`resume` |
+| `session.dispose()` / `run.close()` | `session_shutdown`（`reason: "quit"`） | 最多等 5 秒，超时强制释放 |
+
+扩展处理器抛错不会打断任务，会变成 `extension:error` 事件（`{ session, extension, event, error }`）。
+扩展在 `session_start` 里才注册的工具（如 MCP 的）同样受 `tools` 白名单约束，名字事先不确定时用通配符，如 `tools: ["read", "mcp__*"]`。
 
 **自带 `pi.resourceLoader`**：完全由你的加载器负责资源，SDK 不再干预；这时不能再在角色上声明 skills / extensions / prompts / context。
 
@@ -392,7 +402,7 @@ await run.parallel([
 
 ```ts
 run.stats()     // { runId, status, quiescent, capacities, pools, graph★, tasks: {running, recent}, artifacts, sessions, steps, events }
-run.on(e => …)  // 事件：capacity:grant|release / task:start|retry|end / artifact:write|rejected / summary / fork / step / consumer:item-failed / run:stopping
+run.on(e => …)  // 事件：capacity:grant|release / task:start|retry|end / artifact:write|rejected / summary / fork / step / consumer:item-failed / extension:error / run:stopping
 ```
 
 - `workdir/state.json`：`stats()` 的落盘版，约 300ms 刷新一次。外部只读这一个文件就能看全局。

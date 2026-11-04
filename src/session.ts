@@ -264,6 +264,7 @@ export class Session {
       if (this.role.artifactTool !== false) custom.push(this.makeArtifactTool());
       const tools = [...new Set([...(this.role.tools ?? []), ...(pi.tools ?? []), ...custom.map((t) => t.name)])];
       const settingsManager = pi.settingsManager ?? SettingsManager.inMemory(this.host.piSettings as never);
+      const sessionStartEvent = this.startEvent();
       const { session } = await createAgentSession({
         ...pi, // 资源发现选项 createAgentSession 不认，会被忽略；它们在下面的加载器里生效
         // ↓ SDK 接管：会话文件、模型、产物工具注入、创建时机（角色传了会在创建会话时直接报错）
@@ -277,6 +278,7 @@ export class Session {
         tools,
         customTools: custom,
         settingsManager,
+        sessionStartEvent,
       });
       // 模型回退守卫：pi 在凭证缺失时可能静默换成别的模型，这里硬失败
       const got = session.model ? `${session.model.provider}/${session.model.id}` : "（无）";
@@ -287,6 +289,18 @@ export class Session {
       this.agent = session;
       this.agentModelKey = key;
       this.unsubscribe = session.subscribe((ev) => this.onEvent(ev as unknown as Record<string, unknown>));
+      // 绑定扩展：发 session_start（MCP 等扩展在这里连服务器 / 注册工具）和 resources_discover。
+      // pi 的 CLI / RPC 都会调这一步；SDK 不调，靠 session_start 启动的扩展就全部哑火。
+      try {
+        await session.bindExtensions({
+          mode: "print",
+          onError: (e) =>
+            this.host.emit({ type: "extension:error", session: this.name, extension: e.extensionPath, event: e.event, error: e.error }),
+        });
+      } catch (err) {
+        await this.dispose();
+        throw err;
+      }
     } else if (this.agentModelKey !== key) {
       await this.agent.setModel(model);
       this.agentModelKey = key;
@@ -419,13 +433,44 @@ export class Session {
     return { ok: true, output: agent.getLastAssistantText() ?? "" };
   }
 
-  /** 释放 pi 会话资源（会话文件保留，可再次打开） */
-  dispose(): void {
-    this.unsubscribe?.();
-    this.unsubscribe = undefined;
-    this.agent?.dispose();
+  /**
+   * 释放 pi 会话资源（会话文件保留，可再次打开）。
+   * 先发 session_shutdown 让扩展收尾（如 MCP 断开连接），再释放。
+   */
+  async dispose(): Promise<void> {
+    const agent = this.agent;
     this.agent = undefined;
     this.agentModelKey = undefined;
+    if (!agent) return;
+    try {
+      const runner = agent.extensionRunner;
+      if (runner.hasHandlers("session_shutdown")) {
+        // 扩展收尾最多等 SHUTDOWN_TIMEOUT_MS，免得一个卡住的扩展拖住 run.close
+        let timer: NodeJS.Timeout | undefined;
+        const timeout = new Promise<"timeout">((r) => (timer = setTimeout(() => r("timeout"), SHUTDOWN_TIMEOUT_MS)));
+        const r = await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), timeout]);
+        clearTimeout(timer);
+        if (r === "timeout") throw new Error(`扩展 session_shutdown 超过 ${SHUTDOWN_TIMEOUT_MS}ms 未完成，已强制释放`);
+      }
+    } catch (err) {
+      this.host.emit({ type: "extension:error", session: this.name, extension: "", event: "session_shutdown", error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      this.unsubscribe?.();
+      this.unsubscribe = undefined;
+      agent.dispose();
+    }
+  }
+
+  /**
+   * session_start 的原因：分叉出来、自己还没跑过任务的子会话 fork（带上游文件）；
+   * 文件里已有对话（续跑 / 释放后再用）resume；其余 startup。
+   */
+  private startEvent(): { type: "session_start"; reason: "startup" | "resume" | "fork"; previousSessionFile?: string } {
+    if (this.parent && !this.tasks().some((t) => t.origin === this.name)) {
+      return { type: "session_start", reason: "fork", previousSessionFile: this.host.findSession(this.parent)?.file };
+    }
+    const hasMessages = this.sm.getEntries().some((e: { type: string }) => e.type === "message");
+    return { type: "session_start", reason: hasMessages ? "resume" : "startup" };
   }
 
   // ------------------------------------------------------------ 私有
@@ -559,6 +604,9 @@ export class Session {
 
 // ---------------------------------------------------------------- 辅助
 
+
+/** 释放会话时等扩展 session_shutdown 的上限 */
+const SHUTDOWN_TIMEOUT_MS = 5000;
 
 /** SDK 接管、角色不能在 pi 里指定的创建选项 */
 const MANAGED_KEYS = ["sessionManager", "model", "modelRuntime", "thinkingLevel", "scopedModels", "agentDir", "sessionStartEvent"] as const;

@@ -8,7 +8,7 @@ A lightweight agent workflow SDK based on the pi SDK — session context reuse, 
 
 ```bash
 npm install                      # 或：bash scripts/link-pi.sh（把全局安装的 pi 链进 node_modules）
-npm test                         # 41 个测试，假模型，约 8 秒
+npm test                         # 45 个测试，假模型，约 8 秒
 node examples/01-context.ts      # 上下文：摘要 / 原文继承 / 摘要继承 / 换角色
 node examples/02-relay.ts        # 并行：生产者 + 两个消费池接力；再跑一次看续跑
 ```
@@ -161,7 +161,7 @@ src/
   serialize.ts  按摘要程度序列化任务段；默认摘要提示词
   types.ts      公共类型与错误
   testing.ts    假模型 runtime（不需要凭证）
-test/           sched / artifacts / session / run / contract / agent 六组，41 个用例
+test/           sched / artifacts / session / run / contract / agent 六组，45 个用例
 examples/       01-context、02-relay
 ```
 

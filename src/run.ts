@@ -364,7 +364,7 @@ export class Run {
 
   /** 收尾：释放所有 pi 会话，写最终状态 */
   async close(): Promise<void> {
-    for (const s of this.sessions.values()) s.dispose();
+    await Promise.all([...this.sessions.values()].map((s) => s.dispose()));
     this.status = "closed";
     if (this.stateTimer) clearTimeout(this.stateTimer);
     this.writeState();
