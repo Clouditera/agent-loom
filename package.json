@@ -1,7 +1,6 @@
 {
   "name": "agent-loom",
   "version": "0.1.0",
-  "private": true,
   "repository": {
     "type": "git",
     "url": "https://github.com/Clouditera/agent-loom.git"
@@ -10,8 +9,14 @@
   "license": "Apache-2.0",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
-    "./testing": "./src/testing.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    }
   },
   "engines": {
     "node": ">=22.18"
@@ -24,7 +29,9 @@
     "test": "node --test --test-concurrency=1 test/*.test.ts",
     "typecheck": "tsc -p .",
     "example:context": "node examples/01-context.ts",
-    "example:relay": "node examples/02-relay.ts --fresh"
+    "example:relay": "node examples/02-relay.ts --fresh",
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^1.3.0",
@@ -33,7 +40,7 @@
     "typescript": "^5.9.0"
   },
   "files": [
-    "src",
+    "dist",
     "docs",
     "README.md",
     "LICENSE"

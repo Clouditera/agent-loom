@@ -1,3 +1,4 @@
 node_modules/
 .tmp-test/
 examples/.runs/
+dist/
