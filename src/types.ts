@@ -137,6 +137,36 @@ export interface AgentRole {
   pi?: PiAgentOptions | ((ctx: { model: Model<any>; sessionName: string }) => PiAgentOptions | Promise<PiAgentOptions>);
 }
 
+/**
+ * 一个 agent（一个会话的角色）的外部配置：模型、思考强度、技能、扩展、提示词与工具。
+ * 由调用方按 agent 名给出；工作流只声明有哪些名字，这里负责规范与合并。
+ */
+export interface AgentConfig {
+  /** "provider/model[:thinking]"，或直接给 pi Model；不填用 run 的默认 */
+  model?: ModelRef;
+  /** 思考强度；优先级低于 model 串里的，高于角色自己的 */
+  thinking?: ThinkingLevel;
+  /** 追加到角色技能上的路径 */
+  skills?: AssetPath[];
+  /** 追加到角色上的扩展 */
+  extensions?: Array<AssetPath | ExtensionFactory>;
+  /** 追加到角色上的提示词模板 */
+  prompts?: AssetPath[];
+  /** 追加到白名单里的工具名 */
+  tools?: string[];
+}
+
+/** 一个可配的 agent：名字、给人看的标题与说明、它自己的默认配置。 */
+export interface AgentSpec {
+  key: string;
+  title: string;
+  description?: string;
+  defaults?: AgentConfig;
+}
+
+/** 一次运行接受的 agent 配置，按名字。工作流要到没声明的名字是错误。 */
+export type AgentConfigs = Readonly<Record<string, AgentConfig>>;
+
 export interface RetryPolicy {
   /** 最多尝试几次（含首次）。默认 3 */
   max?: number;
