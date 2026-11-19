@@ -5,7 +5,8 @@
 import type { Model } from "@earendil-works/pi-ai";
 import type { CreateAgentSessionOptions, CreateAgentSessionServicesOptions, ExtensionFactory, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+/** pi 认识的思考档位。某一档某个模型支不支持，由 pi 按模型配置判断（`getSupportedThinkingLevels`），这里只是全集。 */
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /** 数字越小 = 越下游 = 越优先（缺省 50） */
 export type Priority = number;
@@ -18,6 +19,11 @@ export type ModelRef = string | Model<any>;
 export interface CapacityOptions {
   /** 绑定模型 → 这是一个"模型容量"；不填 = 普通资源（沙箱机位等） */
   model?: ModelRef;
+  /**
+   * 这个容量跑在哪个思考档位。给了模型对象时用它：模型对象本来带不了档位，只有从这里进得去，
+   * 不必把档位塞进 "provider/model:thinking" 字符串再拆回来。
+   */
+  thinking?: ThinkingLevel;
   /** 同时几路。由外部能力决定（凭证并发 / 机位数），是真闸门 */
   concurrency: number;
   /** 等待超过此毫秒数视同最高优先（防饿死）。默认 15 分钟 */

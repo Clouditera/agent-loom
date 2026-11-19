@@ -10,6 +10,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai/models";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { ArtifactStore, type CreateInput, type UpdateInput } from "./artifacts.ts";
 import { acquireAll, Capacity, normalizeNeeds, PoolGate, type Permit } from "./sched.ts";
@@ -40,8 +41,6 @@ import {
   type WriteSpec,
 } from "./types.ts";
 import { appendJSONL, atomicWriteJSON, ensureDir, newId, Notifier, readJSON, readJSONL } from "./util.ts";
-
-const THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 export interface RunOptions {
   /** 运行目录：产物、会话、台账、state.json 都落这里。同一目录再启动 = 续跑 */
@@ -226,6 +225,8 @@ export class Run {
     let model: Model<any> | undefined;
     let thinking: ThinkingLevel | undefined;
     if (opts.model !== undefined) ({ model, thinking } = this.resolveModel(opts.model));
+    // 显式给的档位优先：模型对象本来带不到档位，只有从这里进得去
+    thinking = opts.thinking ?? thinking;
     const cap = new Capacity(name, { concurrency: opts.concurrency, agingMs: opts.agingMs, model, thinking }, (e) => this.emit(e));
     this.capacities.set(name, cap);
     this.dirty();
@@ -558,25 +559,37 @@ export class Run {
     throw new Error(`摘要模型调用失败：${last}`);
   }
 
+  /**
+   * "provider/model[:thinking]" 拆成模型与档位。先拆出模型、拿到 pi 的模型对象，再看尾巴是不是它**自己**支持的档位：
+   * 这样模型名里的冒号（`ollama/llama3:8b`）不会被误拆，新档位也不需要在这里添一份名单。
+   */
   private resolveModel(ref: ModelRef): { model: Model<any>; thinking?: ThinkingLevel } {
     if (typeof ref !== "string") return { model: ref };
-    let spec = ref;
-    let thinking: ThinkingLevel | undefined;
-    const colon = ref.lastIndexOf(":");
-    if (colon > 0 && THINKING.has(ref.slice(colon + 1))) {
-      thinking = ref.slice(colon + 1) as ThinkingLevel;
-      spec = ref.slice(0, colon);
-    }
-    const slash = spec.indexOf("/");
+    const slash = ref.indexOf("/");
     if (slash <= 0) throw new Error(`模型写法应为 "provider/model[:thinking]"，收到 ${ref}`);
-    const provider = spec.slice(0, slash);
-    const id = spec.slice(slash + 1);
+    const provider = ref.slice(0, slash);
+    const rest = ref.slice(slash + 1);
+    const colon = rest.lastIndexOf(":");
+    const levels = colon > 0 ? this.thinkingLevelsOf(provider, rest.slice(0, colon)) : [];
+    const tail = colon > 0 ? rest.slice(colon + 1) : "";
+    const isLevel = colon > 0 && levels.includes(tail as ThinkingLevel);
+    const model = this.modelOf(provider, isLevel ? rest.slice(0, colon) : rest, ref);
+    return { model, thinking: isLevel ? (tail as ThinkingLevel) : undefined };
+  }
+
+  /** 这个模型自己支持的档位（pi 按模型配置判断）；模型不存在时返回空，留给 `modelOf` 报错。 */
+  private thinkingLevelsOf(provider: string, id: string): ThinkingLevel[] {
+    const model = this.modelRuntime.getModel(provider, id);
+    return model ? (getSupportedThinkingLevels(model) as ThinkingLevel[]) : [];
+  }
+
+  private modelOf(provider: string, id: string, ref: string): Model<any> {
     const model = this.modelRuntime.getModel(provider, id);
     if (!model) {
       const known = this.modelRuntime.getModels(provider).map((m) => m.id).slice(0, 10);
-      throw new Error(`找不到模型 ${provider}/${id}${known.length ? `；该 provider 下有：${known.join(", ")}` : "；该 provider 未注册"}`);
+      throw new Error(`找不到模型 ${provider}/${id}${known.length ? `；该 provider 下有：${known.join(", ")}` : "；该 provider 未注册"}（写法：provider/model[:thinking]，收到 ${ref}）`);
     }
-    return { model, thinking };
+    return model;
   }
 
   /** 写入校验：写入来源所在的池声明了 writes 时，只放行声明过的 类型+状态 */
@@ -712,7 +725,8 @@ export class Pool {
       await this.gate.admit(tag, signal);
       admitted = true;
       permits = await acquireAll(caps, tag, priority, signal);
-      await session.ensureAgent(modelCap.model, session.role.thinking ?? modelCap.thinking ?? "medium");
+      // 思考强度：容量上的（外部配置落到那里）优先，角色的只作缺省，否则任务类型写在代码里的档位会盖掉用户配置
+      await session.ensureAgent(modelCap.model, modelCap.thinking ?? session.role.thinking ?? "medium");
       session.current = { taskId, attempt: 0, pool: this.name, item: lane?.item, written: [] };
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
