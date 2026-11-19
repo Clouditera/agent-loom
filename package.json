@@ -44,5 +44,8 @@
     "docs",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "dependencies": {
+    "typebox": "^1.3.27"
+  }
 }

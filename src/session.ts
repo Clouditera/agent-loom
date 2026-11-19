@@ -18,7 +18,7 @@ import { relative, resolve, sep, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Model } from "@earendil-works/pi-ai";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import {
   createAgentSession,
   DefaultResourceLoader,
