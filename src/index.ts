@@ -8,6 +8,7 @@
 
 export { createRun, Run, Pool } from "./run.ts";
 export type { RunOptions, ConsumeOptions, ConsumeContext, ConsumeReport } from "./run.ts";
+export { AgentBook, UnknownAgentError, type ResolvedAgent } from "./agents.ts";
 export { Session, DIGEST_KIND } from "./session.ts";
 export type { TrackFiles } from "./session.ts";
 export { Capacity } from "./sched.ts";

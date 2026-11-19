@@ -12,6 +12,7 @@ import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai/models";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { AgentBook } from "./agents.ts";
 import { ArtifactStore, type CreateInput, type UpdateInput } from "./artifacts.ts";
 import { acquireAll, Capacity, normalizeNeeds, PoolGate, type Permit } from "./sched.ts";
 import { DEFAULT_SUMMARY_PROMPT, type EntryLike } from "./serialize.ts";
@@ -21,7 +22,9 @@ import {
   SummaryFailed,
   TaskAborted,
   TaskFailed,
+  type AgentConfigs,
   type AgentRole,
+  type AgentSpec,
   type Artifact,
   type ArtifactSelector,
   type ArtifactSource,
@@ -57,6 +60,8 @@ export interface RunOptions {
   piSettings?: Record<string, unknown>;
   /** 全局静默判定的安静窗口（毫秒），默认 1500 */
   quietMs?: number;
+  /** 各 agent 的配置（按 agent 名）；工作流用 run.agents(specs) 取到角色与容量 */
+  agents?: AgentConfigs;
   /** 消费循环没活时的轮询间隔（毫秒），默认 1000（有新产物写入会立刻唤醒） */
   pollMs?: number;
 }
@@ -144,6 +149,7 @@ export class Run {
   private events: TimedEvent[] = [];
   private summaryCapacity?: string;
   private trackFiles: TrackFiles[];
+  private readonly agentConfigs: AgentConfigs;
   private piSettings: Record<string, unknown>;
   private quietMs: number;
   /** @internal */ readonly pollMs: number;
@@ -171,6 +177,7 @@ export class Run {
     this.modelRuntime = runtime;
     this.summaryCapacity = opts.summaryCapacity;
     this.trackFiles = opts.trackFiles ?? [];
+    this.agentConfigs = opts.agents ?? {};
     this.piSettings = opts.piSettings ?? { compaction: { enabled: true }, retry: { enabled: true, maxRetries: 2 } };
     this.quietMs = opts.quietMs ?? 1500;
     this.pollMs = opts.pollMs ?? 1000;
@@ -214,6 +221,11 @@ export class Run {
   }
 
   // ------------------------------------------------------------ 声明
+
+  /** 工作流声明的 agent 与本 run 的配置：按名字取角色、取容量 */
+  agents(specs: readonly AgentSpec[], given: AgentConfigs = this.agentConfigs): AgentBook {
+    return new AgentBook(specs, given);
+  }
 
   /** 声明资源。带 model = 模型容量（凭证并发）；不带 = 普通资源（沙箱机位等） */
   capacity(name: string, opts: CapacityOptions): Capacity {
@@ -778,6 +790,15 @@ export class Pool {
       run.emit({ type: "task:end", taskId, pool: this.name, status, attempts: rec.attempt, ms: rec.endedAt - rec.startedAt, error: rec.error });
       run.taskEnded(rec);
     }
+  }
+
+  /**
+   * 为某条产物干活：body 里本池跑的任务、代码写的产物都记上这条产物（台账的 item、产物来源的 pool / item），
+   * 和消费循环里一样，只是由代码自己点名。串行段里「先提出、再处理这一条」用它，链路才看得出因果。
+   */
+  async with<T>(itemId: string, body: () => Promise<T>): Promise<T> {
+    if (!this.owner.artifacts.get(itemId)) throw new Error(`池 ${this.name}：没有产物 ${itemId}`);
+    return laneCtx.run({ pool: this.name, item: itemId }, body);
   }
 
   /**
